@@ -19,7 +19,7 @@ const getApiBase = () => {
   }
   
   // Production fallback
-  return `${protocol}//${hostname}:5000/api`;
+  return `${protocol}//${hostname}/api`;
 };
 
 const API_BASE = getApiBase();
