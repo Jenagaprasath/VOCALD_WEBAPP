@@ -1,0 +1,29 @@
+name: Sync to HuggingFace
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Build Frontend
+        run: |
+          cd frontend
+          npm install
+          npm run build
+          cp -r dist/* ../backend/static/
+
+      - name: Push to HuggingFace
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git add -A
+          git diff --staged --quiet || git commit -m "rebuild frontend"
+          git remote add space https://vocald:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/vocald/app
+          git push space main --force
