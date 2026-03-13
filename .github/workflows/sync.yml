@@ -17,6 +17,7 @@ jobs:
           cd frontend
           npm install
           npm run build
+          mkdir -p ../backend/static
           cp -r dist/* ../backend/static/
 
       - name: Push to HuggingFace
