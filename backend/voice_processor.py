@@ -121,23 +121,23 @@ MAX_SEGMENTS_PER_SPEAKER = 15    # cap before outlier rejection
 MIN_PROFILE_DURATION     = 1.5   # skip profiles shorter than this
 
 # Similarity thresholds
-BASE_SIMILARITY_THRESHOLD   = 0.45
-BASE_STRONG_MATCH_THRESHOLD = 0.58
-BASE_VERIFICATION_THRESHOLD = 0.50
+BASE_SIMILARITY_THRESHOLD   = 0.60
+BASE_STRONG_MATCH_THRESHOLD = 0.70
+BASE_VERIFICATION_THRESHOLD = 0.65
 ADAPTIVE_LEARNING_RATE      = (0.02, 0.10)
 
 # Multi-centroid
 ENABLE_MULTI_CENTROID         = True
 MAX_CENTROIDS_PER_PROFILE     = 5
-CENTROID_SIMILARITY_THRESHOLD = 0.70
+CENTROID_SIMILARITY_THRESHOLD = 0.78
 CENTROID_MIN_SAMPLES          = 1
-CENTROID_MERGE_THRESHOLD      = 0.82
+CENTROID_MERGE_THRESHOLD      = 0.88
 CENTROID_QUALITY_WEIGHT       = 0.3
 
 # Adaptive thresholds
 ENABLE_ADAPTIVE_THRESHOLDS = False
-THRESHOLD_MIN              = 0.38
-THRESHOLD_MAX              = 0.75
+THRESHOLD_MIN              = 0.50
+THRESHOLD_MAX              = 0.82
 THRESHOLD_STEP             = 0.02
 PROFILE_MATURITY_THRESHOLD = 5
 FALSE_ACCEPT_PENALTY       = 0.04
@@ -1536,8 +1536,8 @@ def verify_speaker_match(embedding_data: dict, profile_id: int):
             new_f = wccn_manager.transform(new_f)
             old_f = wccn_manager.transform(old_f)
 
-        cos_ok  = float(np.clip(new_f @ old_f, -1.0, 1.0)) >= 0.40
-        euc_ok  = (1.0 / (1.0 + np.linalg.norm(new_f - old_f))) >= 0.35
+        cos_ok  = float(np.clip(new_f @ old_f, -1.0, 1.0)) >= 0.55
+        euc_ok  = (1.0 / (1.0 + np.linalg.norm(new_f - old_f))) >= 0.50
         plda_ok = (plda_manager.score_llr(new_f, old_f) >= 0.0) \
                   if plda_manager.is_ready else True
 
