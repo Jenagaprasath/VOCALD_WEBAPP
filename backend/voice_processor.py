@@ -1151,7 +1151,7 @@ if PyannotePipeline is not None:
     else:
         try:
             diarization_pipeline = PyannotePipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1", token=HF_TOKEN)
+    "pyannote/speaker-diarization-3.1", use_auth_token=HF_TOKEN)
             diarization_pipeline.to(torch.device("cpu"))
             torch.set_num_threads(multiprocessing.cpu_count())
             torch.set_grad_enabled(False)
