@@ -1,13 +1,12 @@
 flask
 flask-cors
 resemblyzer
-pyannote.audio
-torch
-torchaudio
+torch==2.0.1
+torchaudio==2.0.2
 scipy
 numpy
 python-dotenv
 librosa
 soundfile
 transformers
-speechbrain
+speechbrain==0.5.16
