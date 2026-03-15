@@ -2198,3 +2198,4 @@ if __name__ == "__main__":
     log.info("  match    = find_matching_speaker(emb)")
     log.info("  speakers = process_audio_file('meeting.wav', 'meeting.wav')")
     log.info("  print(list_speakers())")
+    
