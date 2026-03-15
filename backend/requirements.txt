@@ -9,3 +9,5 @@ numpy
 python-dotenv
 librosa
 soundfile
+transformers
+speechbrain
