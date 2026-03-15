@@ -2053,3 +2053,4 @@ if __name__ == "__main__":
     print(f"  Multi-Centroid   : {'✅ (max ' + str(MAX_CENTROIDS_PER_PROFILE) + ')' if ENABLE_MULTI_CENTROID else '❌'}")
     print(f"  Adaptive         : {'✅' if ENABLE_ADAPTIVE_THRESHOLDS else '❌'}")
     print("=" * 70)
+    
