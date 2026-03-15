@@ -1,8 +1,8 @@
 flask
 flask-cors
 resemblyzer
-torch==2.4.0
-torchaudio==2.4.0
+torch==2.6.0
+torchaudio==2.6.0
 scipy
 numpy<2
 python-dotenv
@@ -10,4 +10,4 @@ librosa
 soundfile
 transformers>=4.40.0
 speechbrain>=1.0.0
-huggingface_hub>=0.23.0
+huggingface_hub==0.23.4
