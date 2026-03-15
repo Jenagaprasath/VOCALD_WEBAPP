@@ -108,7 +108,7 @@ PLDA_MODEL_PATH       = os.getenv("VOCALD_PLDA",       "vocald_plda.pkl")
 WCCN_MODEL_PATH       = os.getenv("VOCALD_WCCN",       "vocald_wccn.pkl")
 SCORE_NORM_MODEL_PATH = os.getenv("VOCALD_SNORM",      "vocald_score_norm.pkl")
 THRESHOLD_STATE_PATH  = os.getenv("VOCALD_THRESH",     "vocald_thresholds.pkl")
-HF_TOKEN              = os.getenv("HUGGINGFACE_TOKEN", "")
+HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
 
 # Audio
 SAMPLE_RATE           = 16_000
@@ -2304,3 +2304,5 @@ if __name__ == "__main__":
     log.info("  match    = find_matching_speaker(emb)")
     log.info("  speakers = process_audio_file('meeting.wav', 'meeting.wav')")
     log.info("  print(list_speakers())")
+
+    
