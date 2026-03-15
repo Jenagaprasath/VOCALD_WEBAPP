@@ -1,59 +1,23 @@
-"""
-VocalD v3  —  Production-Ready Speaker Identification System
-=============================================================
-Embedding stack : WavLM-Large (50%) + ECAPA-TDNN (30%) + ResNet (20%)
-Diarization     : PyAnnote 3.1  (dual-strategy)
-Backend         : PLDA + WCCN + Adaptive S-Norm + Multi-Centroid
-Ensemble        : cosine/PLDA (85%) + Mahalanobis (15%)
-Scheduler       : APScheduler daily retraining at 03:00
-Storage         : SQLite (auto-created on first run)
-
-Install
--------
-pip install speechbrain transformers torchaudio pyannote.audio \
-            webrtcvad librosa soundfile apscheduler python-dotenv scipy
-
-Usage
------
-    from vocald_final import process_audio_file, extract_voice_embedding, \
-                              find_matching_speaker, daily_model_update
-
-    speakers = process_audio_file("meeting.wav", "meeting.wav")
-    emb      = extract_voice_embedding("clip.wav")
-    match    = find_matching_speaker(emb)
-    daily_model_update(force=True)   # manual retrain
-"""
-
-# ── stdlib ────────────────────────────────────────────────────────────────
-import os
-import time
-import pickle
-import sqlite3
-import logging
-import threading
-import tempfile
-import multiprocessing
-from datetime import datetime
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# ── third-party ───────────────────────────────────────────────────────────
 import numpy as np
+from resemblyzer import VoiceEncoder, preprocess_wav
+from pyannote.audio import Pipeline
+import sqlite3
+from datetime import datetime
+import pickle
+from pathlib import Path
 import torch
+import os
+from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+import time
+from scipy.signal import butter, filtfilt
+from scipy.ndimage import gaussian_filter1d
 import librosa
 import soundfile as sf
 import webrtcvad
-from dotenv import load_dotenv
-from scipy.signal import butter, filtfilt
-from scipy.ndimage import gaussian_filter1d
+import tempfile
 
-# ── optional: PyAnnote ────────────────────────────────────────────────────
-try:
-    from pyannote.audio import Pipeline as PyannotePipeline
-except ImportError:
-    PyannotePipeline = None
-
-# ── optional: SpeechBrain ─────────────────────────────────────────────────
 try:
     from speechbrain.inference.speaker import EncoderClassifier
 except ImportError:
@@ -62,1378 +26,1033 @@ except ImportError:
     except ImportError:
         EncoderClassifier = None
 
-# ── optional: WavLM (HuggingFace transformers) ────────────────────────────
-try:
-    from transformers import WavLMModel, Wav2Vec2FeatureExtractor
-    HAS_WAVLM = True
-except ImportError:
-    HAS_WAVLM = False
-
-# ── optional: APScheduler ─────────────────────────────────────────────────
-try:
-    from apscheduler.schedulers.background import BackgroundScheduler
-    HAS_APSCHEDULER = True
-except ImportError:
-    HAS_APSCHEDULER = False
+# =========================================================================
+# CONFIGURATION
+# =========================================================================
 
 load_dotenv()
 
+DB_PATH = 'vocald.db'
+PLDA_MODEL_PATH = 'vocald_plda.pkl'
+WCCN_MODEL_PATH = 'vocald_wccn.pkl'
+SCORE_NORM_MODEL_PATH = 'vocald_score_norm.pkl'
+THRESHOLD_STATE_PATH = 'vocald_thresholds.pkl'
+SAMPLE_RATE = 16000
 
-# =============================================================================
-# LOGGING
-# =============================================================================
+# SEGMENT / DURATION GATES
+MIN_SEGMENT_DURATION = 0.4
+MIN_SPEAKING_TIME = 1.5
+MAX_SEGMENTS_PER_SPEAKER = 15
+MIN_PROFILE_DURATION = 2.0
 
-def _setup_logging() -> logging.Logger:
-    fmt     = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
-    datefmt = "%Y-%m-%d %H:%M:%S"
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
-    try:
-        handlers.append(logging.FileHandler("vocald.log", encoding="utf-8"))
-    except OSError:
-        pass
-    logging.basicConfig(level=logging.INFO, format=fmt,
-                        datefmt=datefmt, handlers=handlers)
-    return logging.getLogger("vocald")
+# BASE SIMILARITY THRESHOLDS
+BASE_SIMILARITY_THRESHOLD = 0.75
+BASE_STRONG_MATCH_THRESHOLD = 0.82
+BASE_VERIFICATION_THRESHOLD = 0.78
+ADAPTIVE_LEARNING_RATE = (0.02, 0.10)
 
-log = _setup_logging()
+# CENTROID CLUSTERING SETTINGS
+ENABLE_MULTI_CENTROID = True
+MAX_CENTROIDS_PER_PROFILE = 5
+CENTROID_SIMILARITY_THRESHOLD = 0.82
+CENTROID_MIN_SAMPLES = 2
+CENTROID_MERGE_THRESHOLD = 0.90
+CENTROID_QUALITY_WEIGHT = 0.3
 
-
-# =============================================================================
-# CONFIGURATION  — change values here, nowhere else
-# =============================================================================
-
-# Paths
-DB_PATH               = os.getenv("VOCALD_DB",        "vocald.db")
-PLDA_MODEL_PATH       = os.getenv("VOCALD_PLDA",       "vocald_plda.pkl")
-WCCN_MODEL_PATH       = os.getenv("VOCALD_WCCN",       "vocald_wccn.pkl")
-SCORE_NORM_MODEL_PATH = os.getenv("VOCALD_SNORM",      "vocald_score_norm.pkl")
-THRESHOLD_STATE_PATH  = os.getenv("VOCALD_THRESH",     "vocald_thresholds.pkl")
-HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
-
-# Audio
-SAMPLE_RATE           = 16_000
-PLDA_EMBEDDING_DIM    = 256      # all models projected here
-
-# Segment gates
-MIN_SEGMENT_DURATION     = 0.3   # seconds — shorter segments are unreliable
-MIN_SPEAKING_TIME        = 1.0   # minimum per-speaker duration after diarization
-MAX_SEGMENTS_PER_SPEAKER = 15    # cap before outlier rejection
-MIN_PROFILE_DURATION     = 1.5   # skip profiles shorter than this
-
-# Similarity thresholds
-BASE_SIMILARITY_THRESHOLD   = 0.60
-BASE_STRONG_MATCH_THRESHOLD = 0.70
-BASE_VERIFICATION_THRESHOLD = 0.65
-ADAPTIVE_LEARNING_RATE      = (0.02, 0.10)
-
-# Multi-centroid
-ENABLE_MULTI_CENTROID         = True
-MAX_CENTROIDS_PER_PROFILE     = 5
-CENTROID_SIMILARITY_THRESHOLD = 0.78
-CENTROID_MIN_SAMPLES          = 1
-CENTROID_MERGE_THRESHOLD      = 0.88
-CENTROID_QUALITY_WEIGHT       = 0.3
-
-# Adaptive thresholds
+# ADAPTIVE THRESHOLD SETTINGS
 ENABLE_ADAPTIVE_THRESHOLDS = False
-THRESHOLD_MIN              = 0.50
-THRESHOLD_MAX              = 0.82
-THRESHOLD_STEP             = 0.02
+THRESHOLD_MIN = 0.65
+THRESHOLD_MAX = 0.88
+THRESHOLD_STEP = 0.02
 PROFILE_MATURITY_THRESHOLD = 5
-FALSE_ACCEPT_PENALTY       = 0.04
-FALSE_REJECT_REWARD        = 0.02
-SIMILARITY_GAP_THRESHOLD   = 0.15
+FALSE_ACCEPT_PENALTY = 0.04
+FALSE_REJECT_REWARD = -0.02
+SIMILARITY_GAP_THRESHOLD = 0.15
 
-# Embedding fusion (must sum to 1.0; auto-renormalised if a model is missing)
-WAVLM_WEIGHT  = 0.50
-ECAPA_WEIGHT  = 0.30
-RESNET_WEIGHT = 0.20
+# ECAPA-TDNN
+ENABLE_ECAPA = True
+ECAPA_WEIGHT = 0.55
 
-# PLDA
-ENABLE_PLDA           = True
-PLDA_MIN_SPEAKERS     = 3
-PLDA_LATENT_DIM       = 64
+# PLDA SETTINGS
+ENABLE_PLDA = True
+PLDA_MIN_SPEAKERS = 3
+PLDA_EMBEDDING_DIM = 256
+PLDA_LATENT_DIM = 64
 PLDA_RETRAIN_INTERVAL = 5
-PLDA_SCORE_WEIGHT     = 0.65    # blend: PLDA * w + cosine * (1-w)
+PLDA_SCORE_WEIGHT = 0.70
 
-# WCCN
-ENABLE_WCCN                  = True
-WCCN_MIN_SPEAKERS            = 5
+# WCCN SETTINGS
+ENABLE_WCCN = True
+WCCN_MIN_SPEAKERS = 5
 WCCN_MIN_SAMPLES_PER_SPEAKER = 2
-WCCN_RETRAIN_INTERVAL        = 10
-WCCN_REGULARIZATION          = 1e-4
+WCCN_RETRAIN_INTERVAL = 10
+WCCN_REGULARIZATION = 1e-4
 
-# Score normalisation
-ENABLE_SCORE_NORMALIZATION  = True
-SCORE_NORM_METHOD           = "adaptive_snorm"   # zt_norm | adaptive_snorm | cohort
-COHORT_SIZE                 = 100
-ZT_NORM_SIZE                = 50
-SNORM_TOP_N                 = 20
-SCORE_NORM_MIN_SPEAKERS     = 8
+# SCORE NORMALIZATION SETTINGS
+ENABLE_SCORE_NORMALIZATION = True
+SCORE_NORM_METHOD = 'adaptive_snorm'
+COHORT_SIZE = 100
+ZT_NORM_SIZE = 50
+SNORM_TOP_N = 20
+SCORE_NORM_MIN_SPEAKERS = 8
 SCORE_NORM_RETRAIN_INTERVAL = 15
 
-# Ensemble scoring
-ENABLE_MAHALANOBIS     = True
-ENSEMBLE_COSINE_WEIGHT = 0.85
-ENSEMBLE_MAHAL_WEIGHT  = 0.15
-
-# Audio processing
-ENABLE_VAD                   = True
-VAD_AGGRESSIVENESS           = 3       # 0-3; 3 = most aggressive
+# ADVANCED FEATURES
+ENABLE_VAD = True
 ENABLE_GENDER_CLASSIFICATION = True
-ENABLE_QUALITY_SCORING       = True
-OUTLIER_REJECTION_FACTOR     = 3.5
-ENABLE_NOISE_FILTERING       = True
-LOW_FREQ_CUTOFF              = 85      # Hz high-pass
-HIGH_FREQ_CUTOFF             = 7_600   # Hz low-pass
+ENABLE_QUALITY_SCORING = True
+OUTLIER_REJECTION_FACTOR = 2.5
 
-# Daily retraining
-ENABLE_DAILY_RETRAINING = True
-DAILY_RETRAIN_HOUR      = 3
-DAILY_RETRAIN_MINUTE    = 0
+# NOISE FILTERING
+ENABLE_NOISE_FILTERING = True
+LOW_FREQ_CUTOFF = 85
+HIGH_FREQ_CUTOFF = 8000
 
 
-# =============================================================================
-# DATABASE  — schema auto-created on first run
-# =============================================================================
-
-_DB_SCHEMA = """
-CREATE TABLE IF NOT EXISTS voice_profiles (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    name             TEXT    NOT NULL,
-    embedding        BLOB    NOT NULL,
-    first_seen       TEXT    NOT NULL,
-    last_seen        TEXT    NOT NULL,
-    total_recordings INTEGER NOT NULL DEFAULT 1
-);
-CREATE INDEX IF NOT EXISTS idx_voice_profiles_name
-    ON voice_profiles (name);
-"""
-
-_db_lock = threading.Lock()
-
-
-def _get_conn() -> sqlite3.Connection:
-    """Open a connection and guarantee the schema exists."""
-    conn = sqlite3.connect(DB_PATH, timeout=15.0,
-                           check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.executescript(_DB_SCHEMA)
-    conn.commit()
-    return conn
-
-
-def _collect_all_embeddings_from_db() -> dict:
-    """
-    Return {profile_id: [np.ndarray, ...]} of all stored fused embeddings.
-    Handles both multi-centroid dicts and legacy flat profiles gracefully.
-    """
-    result: dict = {}
-    try:
-        with _db_lock:
-            conn = _get_conn()
-            rows = conn.execute(
-                "SELECT id, embedding FROM voice_profiles"
-            ).fetchall()
-            conn.close()
-
-        for pid, blob in rows:
-            data       = pickle.loads(blob)
-            embeddings = []
-
-            if isinstance(data, dict) and "centroids" in data:
-                for c in data["centroids"]:
-                    emb = c.get("fused_embedding") or c.get("resemblyzer_embedding")
-                    if emb is not None:
-                        embeddings.append(np.asarray(emb, dtype=np.float64))
-            elif isinstance(data, dict):
-                emb = data.get("fused_embedding")
-                if emb is None:
-                    emb = data.get("resemblyzer_embedding")
-                if emb is None:
-                    emb = data.get("embedding")
-                if emb is not None:
-                    embeddings.append(np.asarray(emb, dtype=np.float64))
-            else:
-                embeddings.append(np.asarray(data, dtype=np.float64))
-
-            if embeddings:
-                result[pid] = embeddings
-
-    except Exception as exc:
-        log.warning("_collect_all_embeddings_from_db: %s", exc)
-    return result
-
-
-# =============================================================================
-# SCORE NORMALISATION
-# =============================================================================
+# =========================================================================
+# SCORE NORMALIZATION SYSTEM
+# =========================================================================
 
 class ScoreNormalizer:
-    """
-    Implements three normalisation strategies:
-        zt_norm         — Z-norm followed by T-norm
-        adaptive_snorm  — Top-N cohort S-norm  (default, best in practice)
-        cohort          — Simple impostor-mean/std shift
-    """
+    def __init__(self, method='adaptive_snorm'):
+        self.method = method
+        self.is_trained = False
+        self.impostor_mean = None
+        self.impostor_std = None
+        self.target_mean = None
+        self.target_std = None
+        self.cohort_embeddings = []
+        self.speaker_stats = {}
+        self._num_speakers_at_train = 0
 
-    def __init__(self, method: str = "adaptive_snorm"):
-        self.method                 = method
-        self.is_trained             = False
-        self.impostor_mean: float   = 0.5
-        self.impostor_std:  float   = 0.15
-        self.target_mean:   float   = 0.80
-        self.target_std:    float   = 0.10
-        self.cohort_embeddings: list = []
-        self.speaker_stats:     dict = {}
-        self._n_speakers_trained     = 0
-
-    # ── training ─────────────────────────────────────────────────────────
-
-    def train(self, speaker_embeddings: dict) -> None:
-        n = len(speaker_embeddings)
-        if n < SCORE_NORM_MIN_SPEAKERS:
-            log.info("ScoreNorm.train: need >=%d speakers, have %d — skip",
-                     SCORE_NORM_MIN_SPEAKERS, n)
+    def train(self, speaker_embeddings):
+        if len(speaker_embeddings) < SCORE_NORM_MIN_SPEAKERS:
+            print(f"   ScoreNorm: need >= {SCORE_NORM_MIN_SPEAKERS} speakers. "
+                  f"Current: {len(speaker_embeddings)}")
             return
 
-        all_e = [e for embs in speaker_embeddings.values() for e in embs]
-        if len(all_e) > COHORT_SIZE:
-            idx = np.random.choice(len(all_e), COHORT_SIZE, replace=False)
-            self.cohort_embeddings = [all_e[i] for i in idx]
+        all_embeddings = [e for embs in speaker_embeddings.values() for e in embs]
+        if len(all_embeddings) > COHORT_SIZE:
+            indices = np.random.choice(len(all_embeddings), COHORT_SIZE, replace=False)
+            self.cohort_embeddings = [all_embeddings[i] for i in indices]
         else:
-            self.cohort_embeddings = list(all_e)
+            self.cohort_embeddings = all_embeddings.copy()
 
-        sids = list(speaker_embeddings.keys())
-        rng  = np.random.default_rng()
-        imp, tgt = [], []
+        impostor_scores = []
+        target_scores = []
+        speaker_ids = list(speaker_embeddings.keys())
+        rng = np.random.default_rng()
 
-        for _ in range(min(500, n * 10)):
-            if n < 2:
+        for _ in range(min(500, len(speaker_ids) * 10)):
+            if len(speaker_ids) < 2:
                 break
-            s1, s2 = rng.choice(sids, 2, replace=False)
-            e1 = speaker_embeddings[s1][rng.integers(0, len(speaker_embeddings[s1]))]
-            e2 = speaker_embeddings[s2][rng.integers(0, len(speaker_embeddings[s2]))]
-            imp.append(self._cos(e1, e2))
+            sid1, sid2 = rng.choice(speaker_ids, 2, replace=False)
+            embs1 = speaker_embeddings[sid1]
+            embs2 = speaker_embeddings[sid2]
+            impostor_scores.append(self._raw_similarity(
+                embs1[rng.integers(0, len(embs1))],
+                embs2[rng.integers(0, len(embs2))]))
 
-        for sid in sids:
+        for sid in speaker_ids:
             embs = speaker_embeddings[sid]
             if len(embs) >= 2:
                 for _ in range(min(5, len(embs))):
-                    i1, i2 = rng.choice(len(embs), 2, replace=False)
-                    tgt.append(self._cos(embs[i1], embs[i2]))
+                    idx1, idx2 = rng.choice(len(embs), 2, replace=False)
+                    target_scores.append(self._raw_similarity(embs[idx1], embs[idx2]))
 
-        if imp:
-            self.impostor_mean = float(np.mean(imp))
-            self.impostor_std  = float(np.std(imp) + 1e-6)
-        if tgt:
-            self.target_mean = float(np.mean(tgt))
-            self.target_std  = float(np.std(tgt) + 1e-6)
+        if impostor_scores and target_scores:
+            self.impostor_mean = float(np.mean(impostor_scores))
+            self.impostor_std = float(np.std(impostor_scores) + 1e-6)
+            self.target_mean = float(np.mean(target_scores))
+            self.target_std = float(np.std(target_scores) + 1e-6)
+        else:
+            self.impostor_mean = 0.5
+            self.impostor_std = 0.15
+            self.target_mean = 0.8
+            self.target_std = 0.10
 
-        self.speaker_stats = {}
         for sid, embs in speaker_embeddings.items():
             if len(embs) < 2:
                 continue
-            cs = [self._cos(e, ce)
-                  for e  in embs[:min(5, len(embs))]
-                  for ce in self.cohort_embeddings[:ZT_NORM_SIZE]]
-            if cs:
+            cohort_scores = [self._raw_similarity(emb, ce)
+                             for emb in embs[:min(5, len(embs))]
+                             for ce in self.cohort_embeddings[:ZT_NORM_SIZE]]
+            if cohort_scores:
                 self.speaker_stats[sid] = {
-                    "mean": float(np.mean(cs)),
-                    "std":  float(np.std(cs) + 1e-6),
+                    'mean': float(np.mean(cohort_scores)),
+                    'std': float(np.std(cohort_scores) + 1e-6)
                 }
 
-        self.is_trained          = True
-        self._n_speakers_trained = n
-        log.info("ScoreNorm trained | method=%s | speakers=%d | "
-                 "imp=%.3f+-%.3f  tgt=%.3f+-%.3f",
-                 self.method, n,
-                 self.impostor_mean, self.impostor_std,
-                 self.target_mean,   self.target_std)
+        self.is_trained = True
+        self._num_speakers_at_train = len(speaker_embeddings)
+        print(f"   ScoreNorm trained | method={self.method} | speakers={len(speaker_embeddings)}")
 
-    # ── inference ─────────────────────────────────────────────────────────
-
-    def normalize(self, raw: float,
-                  test_emb=None, enroll_emb=None, speaker_id=None) -> float:
+    def normalize(self, raw_score, test_emb=None, enroll_emb=None, speaker_id=None):
         if not self.is_trained:
-            return raw
-        if self.method == "zt_norm":
-            return self._zt_norm(raw, test_emb, enroll_emb)
-        if self.method == "adaptive_snorm":
-            return self._adaptive_snorm(raw, test_emb)
-        return self._cohort_norm(raw)
+            return raw_score
+        if self.method == 'zt_norm':
+            return self._zt_norm(raw_score, test_emb, enroll_emb)
+        elif self.method == 'adaptive_snorm':
+            return self._adaptive_snorm(raw_score, test_emb)
+        return self._cohort_norm(raw_score)
 
-    def _zt_norm(self, raw, test_emb, enroll_emb) -> float:
-        zs  = ([self._cos(test_emb, ce)
-                for ce in self.cohort_embeddings[:ZT_NORM_SIZE]]
-               if test_emb is not None and self.cohort_embeddings else [])
-        zm  = float(np.mean(zs))  if zs else 0.0
-        zsd = float(np.std(zs) + 1e-6) if zs else 1.0
-        zn  = (raw - zm) / zsd
-
+    def _zt_norm(self, raw_score, test_emb, enroll_emb):
+        z_scores = ([self._raw_similarity(test_emb, ce)
+                     for ce in self.cohort_embeddings[:ZT_NORM_SIZE]]
+                    if test_emb is not None and self.cohort_embeddings else [])
+        if z_scores:
+            z_mean = np.mean(z_scores)
+            z_std = np.std(z_scores) + 1e-6
+            z_norm = (raw_score - z_mean) / z_std
+        else:
+            z_norm = raw_score
+        t_norm = z_norm
         if enroll_emb is not None and self.cohort_embeddings:
-            ts  = [self._cos(enroll_emb, ce)
-                   for ce in self.cohort_embeddings[:ZT_NORM_SIZE]]
-            tm  = float(np.mean(ts))
-            tsd = float(np.std(ts) + 1e-6)
-            zn  = zn - (tm - zm) / tsd
+            t_scores = [self._raw_similarity(enroll_emb, ce)
+                        for ce in self.cohort_embeddings[:ZT_NORM_SIZE]]
+            if t_scores:
+                t_norm = z_norm - (np.mean(t_scores) - (np.mean(z_scores) if z_scores else 0)) / (np.std(t_scores) + 1e-6)
+        return float(np.clip(1.0 / (1.0 + np.exp(-t_norm)), 0.0, 1.0))
 
-        return float(np.clip(_sigmoid(zn), 0.0, 1.0))
-
-    def _adaptive_snorm(self, raw, test_emb) -> float:
+    def _adaptive_snorm(self, raw_score, test_emb):
         if test_emb is None or not self.cohort_embeddings:
-            return self._cohort_norm(raw)
-        scores = sorted([self._cos(test_emb, ce) for ce in self.cohort_embeddings],
-                        reverse=True)[:SNORM_TOP_N]
-        if not scores:
-            return raw
-        sm, ss = float(np.mean(scores)), float(np.std(scores) + 1e-6)
-        return float(np.clip(_sigmoid((raw - sm) / ss * 2.0), 0.0, 1.0))
+            return self._cohort_norm(raw_score)
+        top_scores = sorted([self._raw_similarity(test_emb, ce)
+                             for ce in self.cohort_embeddings], reverse=True)[:SNORM_TOP_N]
+        if top_scores:
+            s_mean = np.mean(top_scores)
+            s_std = np.std(top_scores) + 1e-6
+            normalized = 1.0 / (1.0 + np.exp(-(raw_score - s_mean) / s_std * 2.0))
+        else:
+            normalized = raw_score
+        return float(np.clip(normalized, 0.0, 1.0))
 
-    def _cohort_norm(self, raw) -> float:
-        n = (raw - self.impostor_mean) / self.impostor_std
-        return float(np.clip(_sigmoid(n * 2.0), 0.0, 1.0))
+    def _cohort_norm(self, raw_score):
+        if self.impostor_mean is None:
+            return raw_score
+        normalized = (raw_score - self.impostor_mean) / self.impostor_std
+        return float(np.clip(1.0 / (1.0 + np.exp(-normalized * 2.0)), 0.0, 1.0))
 
-    # ── helpers ───────────────────────────────────────────────────────────
+    def _raw_similarity(self, emb1, emb2):
+        a = np.array(emb1, dtype=np.float64)
+        b = np.array(emb2, dtype=np.float64)
+        a = a / (np.linalg.norm(a) + 1e-8)
+        b = b / (np.linalg.norm(b) + 1e-8)
+        return float(np.clip(np.dot(a, b), -1.0, 1.0))
 
-    @staticmethod
-    def _cos(a, b) -> float:
-        a = np.asarray(a, np.float64); a = a / (np.linalg.norm(a) + 1e-8)
-        b = np.asarray(b, np.float64); b = b / (np.linalg.norm(b) + 1e-8)
-        return float(np.clip(a @ b, -1.0, 1.0))
+    def save(self, path=SCORE_NORM_MODEL_PATH):
+        with open(path, 'wb') as f:
+            pickle.dump({'method': self.method, 'is_trained': self.is_trained,
+                         'impostor_mean': self.impostor_mean, 'impostor_std': self.impostor_std,
+                         'target_mean': self.target_mean, 'target_std': self.target_std,
+                         'cohort_embeddings': self.cohort_embeddings,
+                         'speaker_stats': self.speaker_stats,
+                         'num_speakers': self._num_speakers_at_train}, f)
 
-    # ── persistence ───────────────────────────────────────────────────────
-
-    def save(self, path: str = SCORE_NORM_MODEL_PATH) -> None:
-        with open(path, "wb") as fh:
-            pickle.dump(self.__dict__, fh, protocol=4)
-
-    def load(self, path: str = SCORE_NORM_MODEL_PATH) -> bool:
+    def load(self, path=SCORE_NORM_MODEL_PATH):
         if not os.path.exists(path):
             return False
         try:
-            with open(path, "rb") as fh:
-                self.__dict__.update(pickle.load(fh))
-            log.info("ScoreNorm loaded | method=%s | speakers_at_train=%d",
-                     self.method, self._n_speakers_trained)
+            with open(path, 'rb') as f:
+                state = pickle.load(f)
+            self.__dict__.update(state)
+            self._num_speakers_at_train = state.get('num_speakers', 0)
+            print(f"   ScoreNorm loaded | method={self.method}")
             return True
-        except Exception as exc:
-            log.warning("ScoreNorm load error: %s", exc)
+        except Exception as e:
+            print(f"   ScoreNorm load error: {e}")
             return False
 
 
 class ScoreNormManager:
     def __init__(self):
         self.normalizer = ScoreNormalizer(method=SCORE_NORM_METHOD)
-        self._since     = 0
-        if ENABLE_SCORE_NORMALIZATION and not self.normalizer.load():
-            self._retrain()
+        self._profiles_since_last_train = 0
+        self._initialise()
 
-    def _retrain(self):
-        embs = _collect_all_embeddings_from_db()
-        if len(embs) < SCORE_NORM_MIN_SPEAKERS:
+    def _initialise(self):
+        if not ENABLE_SCORE_NORMALIZATION:
+            return
+        if self.normalizer.load(SCORE_NORM_MODEL_PATH):
+            return
+        self.retrain()
+
+    def retrain(self):
+        speaker_embeddings = _collect_all_embeddings_from_db()
+        if len(speaker_embeddings) < SCORE_NORM_MIN_SPEAKERS:
             self.normalizer.is_trained = False
             return
-        self.normalizer.train(embs)
-        self.normalizer.save()
-        self._since = 0
+        self.normalizer.train(speaker_embeddings)
+        self.normalizer.save(SCORE_NORM_MODEL_PATH)
+        self._profiles_since_last_train = 0
 
     def on_new_profile(self):
-        self._since += 1
-        if self._since >= SCORE_NORM_RETRAIN_INTERVAL:
-            self._retrain()
+        self._profiles_since_last_train += 1
+        if self._profiles_since_last_train >= SCORE_NORM_RETRAIN_INTERVAL:
+            self.retrain()
 
     @property
-    def is_ready(self) -> bool:
+    def is_ready(self):
         return ENABLE_SCORE_NORMALIZATION and self.normalizer.is_trained
 
-    def normalize(self, score: float, test_emb=None,
-                  enroll_emb=None, speaker_id=None) -> float:
-        return (self.normalizer.normalize(score, test_emb, enroll_emb, speaker_id)
-                if self.is_ready else score)
+    def normalize(self, raw_score, test_emb=None, enroll_emb=None, speaker_id=None):
+        if not self.is_ready:
+            return raw_score
+        return self.normalizer.normalize(raw_score, test_emb, enroll_emb, speaker_id)
 
 
-# =============================================================================
-# WCCN — Within-Class Covariance Normalisation
-# =============================================================================
+# =========================================================================
+# WCCN
+# =========================================================================
 
 class WCCN:
-    def __init__(self):
-        self.W    = None
+    def __init__(self, embedding_dim=PLDA_EMBEDDING_DIM):
+        self.embedding_dim = embedding_dim
+        self.W = None
         self.mean = None
-        self.is_trained              = False
-        self._n_speakers_trained     = 0
+        self.is_trained = False
+        self._num_speakers_at_train = 0
 
-    def train(self, speaker_embeddings: dict) -> None:
-        valid = {sid: e for sid, e in speaker_embeddings.items()
-                 if len(e) >= WCCN_MIN_SAMPLES_PER_SPEAKER}
+    def train(self, speaker_embeddings):
+        valid = {sid: embs for sid, embs in speaker_embeddings.items()
+                 if len(embs) >= WCCN_MIN_SAMPLES_PER_SPEAKER}
         if len(valid) < WCCN_MIN_SPEAKERS:
-            log.info("WCCN.train: need >=%d qualified speakers, have %d — skip",
-                     WCCN_MIN_SPEAKERS, len(valid))
             return
-
-        all_e = np.array([e for embs in valid.values() for e in embs],
-                         dtype=np.float64)
-        D         = all_e.shape[1]
-        self.mean = all_e.mean(axis=0)
-
+        all_embs = np.array([e for embs in valid.values() for e in embs], dtype=np.float64)
+        D = all_embs.shape[1]
+        self.mean = all_embs.mean(axis=0)
         Sw = np.zeros((D, D), dtype=np.float64)
-        n  = 0
+        n = 0
         for embs in valid.values():
-            arr = np.asarray(embs, dtype=np.float64)
-            c   = arr - arr.mean(axis=0)
+            arr = np.array(embs, dtype=np.float64)
+            c = arr - arr.mean(axis=0)
             Sw += c.T @ c
-            n  += len(embs)
-
+            n += len(embs)
         Sw = Sw / max(n, 1) + np.eye(D) * WCCN_REGULARIZATION
         ev, evec = np.linalg.eigh(Sw)
-        ev       = np.maximum(ev, WCCN_REGULARIZATION)
-        self.W   = evec @ np.diag(1.0 / np.sqrt(ev)) @ evec.T
+        ev = np.maximum(ev, WCCN_REGULARIZATION)
+        self.W = evec @ np.diag(1.0 / np.sqrt(ev)) @ evec.T
+        self.is_trained = True
+        self._num_speakers_at_train = len(valid)
+        print(f"   WCCN trained | speakers={len(valid)}")
 
-        self.is_trained          = True
-        self._n_speakers_trained = len(valid)
-        log.info("WCCN trained | speakers=%d | dim=%d", len(valid), D)
-
-    def transform(self, emb: np.ndarray) -> np.ndarray:
+    def transform(self, embedding):
         if not self.is_trained or self.W is None:
-            return emb
-        out = self.W @ (emb.astype(np.float64) - self.mean)
-        n   = np.linalg.norm(out)
+            return embedding
+        out = self.W @ (embedding.astype(np.float64) - self.mean)
+        n = np.linalg.norm(out)
         return out / n if n > 1e-8 else out
 
-    def save(self, path: str = WCCN_MODEL_PATH) -> None:
-        with open(path, "wb") as fh:
-            pickle.dump({"W": self.W, "mean": self.mean,
-                         "is_trained": self.is_trained,
-                         "n_speakers": self._n_speakers_trained}, fh, protocol=4)
+    def save(self, path=WCCN_MODEL_PATH):
+        with open(path, 'wb') as f:
+            pickle.dump({'embedding_dim': self.embedding_dim, 'W': self.W,
+                         'mean': self.mean, 'is_trained': self.is_trained,
+                         'num_speakers': self._num_speakers_at_train}, f)
 
-    def load(self, path: str = WCCN_MODEL_PATH) -> bool:
+    def load(self, path=WCCN_MODEL_PATH):
         if not os.path.exists(path):
             return False
         try:
-            with open(path, "rb") as fh:
-                s = pickle.load(fh)
-            self.W, self.mean, self.is_trained = s["W"], s["mean"], s["is_trained"]
-            self._n_speakers_trained = s.get("n_speakers", 0)
-            log.info("WCCN loaded | speakers_at_train=%d", self._n_speakers_trained)
+            with open(path, 'rb') as f:
+                s = pickle.load(f)
+            self.embedding_dim = s['embedding_dim']
+            self.W = s['W']
+            self.mean = s['mean']
+            self.is_trained = s['is_trained']
+            self._num_speakers_at_train = s.get('num_speakers', 0)
+            print(f"   WCCN loaded | speakers_at_train={self._num_speakers_at_train}")
             return True
-        except Exception as exc:
-            log.warning("WCCN load error: %s", exc)
+        except Exception as e:
+            print(f"   WCCN load error: {e}")
             return False
 
 
 class WCCNManager:
     def __init__(self):
-        self.wccn   = WCCN()
-        self._since = 0
-        if ENABLE_WCCN and not self.wccn.load():
-            self._retrain()
+        self.wccn = WCCN(embedding_dim=PLDA_EMBEDDING_DIM)
+        self._profiles_since_last_train = 0
+        self._initialise()
 
-    def _retrain(self):
-        embs = _collect_all_embeddings_from_db()
-        if len(embs) < WCCN_MIN_SPEAKERS:
+    def _initialise(self):
+        if not ENABLE_WCCN:
+            return
+        if self.wccn.load(WCCN_MODEL_PATH):
+            return
+        self.retrain()
+
+    def retrain(self):
+        speaker_embeddings = _collect_all_embeddings_from_db()
+        if len(speaker_embeddings) < WCCN_MIN_SPEAKERS:
             self.wccn.is_trained = False
             return
-        self.wccn.train(embs)
-        self.wccn.save()
-        self._since = 0
+        self.wccn.train(speaker_embeddings)
+        self.wccn.save(WCCN_MODEL_PATH)
+        self._profiles_since_last_train = 0
 
     def on_new_profile(self):
-        self._since += 1
-        if self._since >= WCCN_RETRAIN_INTERVAL:
-            self._retrain()
+        self._profiles_since_last_train += 1
+        if self._profiles_since_last_train >= WCCN_RETRAIN_INTERVAL:
+            self.retrain()
 
     @property
-    def is_ready(self) -> bool:
+    def is_ready(self):
         return ENABLE_WCCN and self.wccn.is_trained
 
-    def transform(self, emb: np.ndarray) -> np.ndarray:
-        return self.wccn.transform(emb) if self.is_ready else emb
+    def transform(self, embedding):
+        return self.wccn.transform(embedding) if self.is_ready else embedding
 
 
-# =============================================================================
-# MULTI-CENTROID VOICE PROFILE
-# =============================================================================
+def _collect_all_embeddings_from_db():
+    result = {}
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        rows = conn.execute('SELECT id, embedding FROM voice_profiles').fetchall()
+        conn.close()
+        for pid, blob in rows:
+            data = pickle.loads(blob)
+            embeddings = []
+            if isinstance(data, dict) and 'centroids' in data:
+                obj = VoiceProfileCentroid.from_dict(data)
+                for c in obj.centroids:
+                    emb = c.get('resemblyzer_embedding')
+                    if emb is not None:
+                        embeddings.append(np.array(emb, dtype=np.float64))
+            elif isinstance(data, dict):
+                emb = data.get('resemblyzer_embedding')
+                if emb is None:
+                    emb = data.get('embedding')
+                if emb is not None:
+                    embeddings.append(np.array(emb, dtype=np.float64))
+            else:
+                embeddings.append(np.array(data, dtype=np.float64))
+            if embeddings:
+                result[pid] = embeddings
+    except Exception as e:
+        print(f"   DB read error: {e}")
+    return result
+
+
+# =========================================================================
+# MULTI-CENTROID CLUSTERING SYSTEM
+# =========================================================================
 
 class VoiceProfileCentroid:
-    """
-    Maintains up to MAX_CENTROIDS_PER_PROFILE acoustic centroids per speaker.
-    New embeddings are routed to the nearest centroid (if close enough) or
-    spawn a new one.  Centroids are periodically merged and pruned.
-    """
-
-    def __init__(self, max_centroids: int = MAX_CENTROIDS_PER_PROFILE):
-        self.centroids:     list = []
-        self.max_centroids: int  = max_centroids
-        self.total_samples: int  = 0
-        self.metadata: dict = {
-            "created_at":   datetime.now().isoformat(),
-            "last_updated": datetime.now().isoformat(),
+    def __init__(self, max_centroids=MAX_CENTROIDS_PER_PROFILE):
+        self.centroids = []
+        self.max_centroids = max_centroids
+        self.total_samples = 0
+        self.metadata = {
+            'created_at': datetime.now().isoformat(),
+            'last_updated': datetime.now().isoformat(),
         }
 
-    # ── public API ────────────────────────────────────────────────────────
-
-    def add_embedding(self, emb_data: dict,
-                      quality: float = 1.0, duration: float = 1.0) -> None:
+    def add_embedding(self, embedding_data, quality=1.0, duration=1.0):
         self.total_samples += 1
-        fused = _get_fused(emb_data)
-        ecapa = emb_data.get("ecapa_embedding") if isinstance(emb_data, dict) else None
+        res_emb = self._extract_resemblyzer(embedding_data)
+        ecapa_emb = embedding_data.get('ecapa_embedding') if isinstance(embedding_data, dict) else None
 
         if not self.centroids:
-            self._new(fused, ecapa, quality, duration, emb_data)
+            self._create_new_centroid(res_emb, ecapa_emb, quality, duration, embedding_data)
+            return
+
+        best_idx, best_sim = self._find_best_centroid(res_emb)
+        if best_sim >= CENTROID_SIMILARITY_THRESHOLD:
+            self._update_centroid(best_idx, res_emb, ecapa_emb, quality, duration)
+        elif len(self.centroids) < self.max_centroids:
+            self._create_new_centroid(res_emb, ecapa_emb, quality, duration, embedding_data)
         else:
-            idx, sim = self._nearest(fused)
-            if sim >= CENTROID_SIMILARITY_THRESHOLD:
-                self._update(idx, fused, ecapa, quality, duration)
-            elif len(self.centroids) < self.max_centroids:
-                self._new(fused, ecapa, quality, duration, emb_data)
-            else:
-                self._update(idx, fused, ecapa, quality, duration)
+            self._update_centroid(best_idx, res_emb, ecapa_emb, quality, duration)
 
         if self.total_samples % 10 == 0:
-            self._merge()
-            self._prune()
+            self._merge_similar_centroids()
+            self._prune_weak_centroids()
+        self.metadata['last_updated'] = datetime.now().isoformat()
 
-        self.metadata["last_updated"] = datetime.now().isoformat()
+    def _extract_resemblyzer(self, data):
+        if isinstance(data, dict):
+            emb = data.get('resemblyzer_embedding')
+            if emb is None:
+                emb = data.get('embedding', data)
+            return np.array(emb, dtype=np.float64)
+        return np.array(data, dtype=np.float64)
 
-    def best_score(self, emb_data: dict,
-                   plda_mgr=None, wccn_mgr=None,
-                   norm_mgr=None, speaker_id=None) -> float:
-        if not self.centroids:
-            return 0.0
-
-        fused = _get_fused(emb_data)
-        if wccn_mgr and wccn_mgr.is_ready:
-            fused = wccn_mgr.transform(fused)
-
-        ecapa = emb_data.get("ecapa_embedding") if isinstance(emb_data, dict) else None
-
-        scores, weights = [], []
-        for c in self.centroids:
-            cf = np.asarray(c["fused_embedding"], dtype=np.float64)
-            if wccn_mgr and wccn_mgr.is_ready:
-                cf = wccn_mgr.transform(cf)
-
-            cos  = float(np.clip(fused @ cf, -1.0, 1.0))
-            euc  = 1.0 / (1.0 + np.linalg.norm(fused - cf))
-            pear = float(np.clip(np.corrcoef(fused, cf)[0, 1], -1.0, 1.0))
-            fs   = 0.65 * cos + 0.25 * euc + 0.10 * pear
-
-            ce = c.get("ecapa_embedding")
-            if ecapa is not None and ce is not None:
-                es   = float(np.clip(np.asarray(ecapa) @ np.asarray(ce), -1.0, 1.0))
-                base = ECAPA_WEIGHT / (ECAPA_WEIGHT + RESNET_WEIGHT) * es + \
-                       RESNET_WEIGHT / (ECAPA_WEIGHT + RESNET_WEIGHT) * fs
-            else:
-                base = fs
-
-            if plda_mgr and plda_mgr.is_ready:
-                pp   = plda_mgr.score_prob(fused, cf)
-                sc   = PLDA_SCORE_WEIGHT * pp + (1.0 - PLDA_SCORE_WEIGHT) * base
-            else:
-                sc = base
-
-            if norm_mgr and norm_mgr.is_ready:
-                sc = norm_mgr.normalize(sc, test_emb=fused,
-                                        enroll_emb=cf, speaker_id=speaker_id)
-
-            scores.append(sc)
-            weights.append(
-                c["quality_avg"] ** CENTROID_QUALITY_WEIGHT
-                * np.log1p(c["sample_count"])
-            )
-
-        sc_arr = np.asarray(scores)
-        wt_arr = np.asarray(weights)
-        wt_arr = wt_arr / wt_arr.sum()
-        return float(0.85 * sc_arr.max() + 0.15 * np.average(sc_arr, weights=wt_arr))
-
-    def primary(self):
-        return max(self.centroids, key=lambda c: c["sample_count"]) \
-               if self.centroids else None
-
-    def to_dict(self) -> dict:
-        return {"centroids":     self.centroids,
-                "total_samples": self.total_samples,
-                "metadata":      self.metadata}
-
-    @classmethod
-    def from_dict(cls, data: dict,
-                  max_centroids: int = MAX_CENTROIDS_PER_PROFILE) -> "VoiceProfileCentroid":
-        obj = cls(max_centroids)
-        obj.centroids     = data.get("centroids", [])
-        obj.total_samples = data.get("total_samples", 0)
-        obj.metadata      = data.get("metadata", {
-            "created_at":   datetime.now().isoformat(),
-            "last_updated": datetime.now().isoformat(),
-        })
-        return obj
-
-    # ── internals ─────────────────────────────────────────────────────────
-
-    def _nearest(self, emb: np.ndarray):
-        sims = [
-            0.7 * float(np.clip(emb @ np.asarray(c["fused_embedding"]), -1.0, 1.0))
-            + 0.3 / (1.0 + np.linalg.norm(emb - np.asarray(c["fused_embedding"])))
-            for c in self.centroids
-        ]
+    def _find_best_centroid(self, embedding):
+        sims = [float(np.clip(0.7 * np.dot(embedding, c['resemblyzer_embedding']), -1.0, 1.0)
+                      + 0.3 / (1.0 + np.linalg.norm(embedding - c['resemblyzer_embedding'])))
+                for c in self.centroids]
         idx = int(np.argmax(sims))
         return idx, sims[idx]
 
-    def _new(self, fused, ecapa, quality, duration, data):
+    def _create_new_centroid(self, res_emb, ecapa_emb, quality, duration, full_data):
         self.centroids.append({
-            "fused_embedding": fused.copy(),
-            "ecapa_embedding": ecapa.copy() if ecapa is not None else None,
-            "sample_count":   1,
-            "quality_avg":    float(quality),
-            "weight":         float(quality * duration),
-            "duration_total": float(duration),
-            "gender":         data.get("gender", "unknown")
-                              if isinstance(data, dict) else "unknown",
-            "created_at":     datetime.now().isoformat(),
+            'resemblyzer_embedding': res_emb.copy(),
+            'ecapa_embedding': ecapa_emb.copy() if ecapa_emb is not None else None,
+            'weight': quality * duration, 'sample_count': 1,
+            'quality_avg': quality, 'duration_total': duration,
+            'gender': full_data.get('gender', 'unknown') if isinstance(full_data, dict) else 'unknown',
+            'created_at': datetime.now().isoformat(),
         })
 
-    def _update(self, idx, fused, ecapa, quality, duration):
-        c     = self.centroids[idx]
-        alpha = (min(0.15, max(0.02, 1.0 / (c["sample_count"] + 1)))
-                 * (0.7 + 0.3 * quality))
+    def _update_centroid(self, idx, res_emb, ecapa_emb, quality, duration):
+        c = self.centroids[idx]
+        alpha = min(0.15, max(0.02, 1.0 / (c['sample_count'] + 1))) * (0.7 + 0.3 * quality)
+        new_r = (1 - alpha) * c['resemblyzer_embedding'] + alpha * res_emb
+        new_r /= (np.linalg.norm(new_r) + 1e-8)
+        c['resemblyzer_embedding'] = new_r
+        if ecapa_emb is not None and c['ecapa_embedding'] is not None:
+            new_e = (1 - alpha) * c['ecapa_embedding'] + alpha * ecapa_emb
+            new_e /= (np.linalg.norm(new_e) + 1e-8)
+            c['ecapa_embedding'] = new_e
+        elif ecapa_emb is not None:
+            c['ecapa_embedding'] = ecapa_emb.copy()
+        c['sample_count'] += 1
+        c['weight'] += quality * duration
+        c['quality_avg'] = (c['quality_avg'] * (c['sample_count'] - 1) + quality) / c['sample_count']
+        c['duration_total'] += duration
 
-        nf = (1 - alpha) * np.asarray(c["fused_embedding"]) + alpha * fused
-        nf /= (np.linalg.norm(nf) + 1e-8)
-        c["fused_embedding"] = nf
-
-        if ecapa is not None:
-            ce = c.get("ecapa_embedding")
-            if ce is not None:
-                ne = (1 - alpha) * np.asarray(ce) + alpha * ecapa
-                ne /= (np.linalg.norm(ne) + 1e-8)
-                c["ecapa_embedding"] = ne
-            else:
-                c["ecapa_embedding"] = ecapa.copy()
-
-        c["sample_count"]   += 1
-        c["weight"]          += quality * duration
-        c["quality_avg"]      = ((c["quality_avg"] * (c["sample_count"] - 1) + quality)
-                                 / c["sample_count"])
-        c["duration_total"]  += duration
-
-    def _merge(self):
+    def _merge_similar_centroids(self):
         i = 0
         while i < len(self.centroids) - 1:
             j = i + 1
             while j < len(self.centroids):
-                fi = np.asarray(self.centroids[i]["fused_embedding"])
-                fj = np.asarray(self.centroids[j]["fused_embedding"])
-                if float(np.clip(fi @ fj, -1.0, 1.0)) >= CENTROID_MERGE_THRESHOLD:
+                sim = float(np.clip(np.dot(
+                    self.centroids[i]['resemblyzer_embedding'],
+                    self.centroids[j]['resemblyzer_embedding']), -1.0, 1.0))
+                if sim >= CENTROID_MERGE_THRESHOLD:
                     ci, cj = self.centroids[i], self.centroids[j]
-                    tot    = ci["sample_count"] + cj["sample_count"]
-                    wi     = ci["sample_count"] / tot
-                    wj     = cj["sample_count"] / tot
-                    m      = wi * fi + wj * fj
-                    m     /= (np.linalg.norm(m) + 1e-8)
-                    ci["fused_embedding"] = m
-                    if ci.get("ecapa_embedding") is not None and cj.get("ecapa_embedding") is not None:
-                        me  = wi * np.asarray(ci["ecapa_embedding"]) + wj * np.asarray(cj["ecapa_embedding"])
+                    tot = ci['sample_count'] + cj['sample_count']
+                    wi, wj = ci['sample_count'] / tot, cj['sample_count'] / tot
+                    m = wi * ci['resemblyzer_embedding'] + wj * cj['resemblyzer_embedding']
+                    m /= (np.linalg.norm(m) + 1e-8)
+                    ci['resemblyzer_embedding'] = m
+                    if ci['ecapa_embedding'] is not None and cj['ecapa_embedding'] is not None:
+                        me = wi * ci['ecapa_embedding'] + wj * cj['ecapa_embedding']
                         me /= (np.linalg.norm(me) + 1e-8)
-                        ci["ecapa_embedding"] = me
-                    ci["sample_count"]   = tot
-                    ci["weight"]        += cj["weight"]
-                    ci["quality_avg"]    = wi * ci["quality_avg"] + wj * cj["quality_avg"]
-                    ci["duration_total"] += cj["duration_total"]
+                        ci['ecapa_embedding'] = me
+                    ci['sample_count'] = tot
+                    ci['weight'] += cj['weight']
+                    ci['quality_avg'] = wi * ci['quality_avg'] + wj * cj['quality_avg']
+                    ci['duration_total'] += cj['duration_total']
                     del self.centroids[j]
                 else:
                     j += 1
             i += 1
 
-    def _prune(self):
+    def _prune_weak_centroids(self):
         if len(self.centroids) <= 2:
             return
-        med = float(np.median([c["sample_count"] for c in self.centroids]))
+        median_count = np.median([c['sample_count'] for c in self.centroids])
         self.centroids = [c for c in self.centroids
-                          if c["sample_count"] >= max(CENTROID_MIN_SAMPLES, med * 0.15)]
+                          if c['sample_count'] >= max(CENTROID_MIN_SAMPLES, median_count * 0.15)]
+
+    def get_best_match_score(self, embedding_data, use_plda=False, plda_manager=None,
+                             wccn_manager=None, score_norm_manager=None, speaker_id=None):
+        if not self.centroids:
+            return 0.0
+
+        res_emb = self._extract_resemblyzer(embedding_data)
+        if wccn_manager and wccn_manager.is_ready:
+            res_emb = wccn_manager.transform(res_emb)
+
+        ecapa_emb = embedding_data.get('ecapa_embedding') if isinstance(embedding_data, dict) else None
+
+        scores, weights = [], []
+        for c in self.centroids:
+            cent_res = np.array(c['resemblyzer_embedding'], dtype=np.float64)
+            if wccn_manager and wccn_manager.is_ready:
+                cent_res = wccn_manager.transform(cent_res)
+
+            cos_sim = float(np.clip(np.dot(res_emb, cent_res), -1.0, 1.0))
+            euc_sim = 1.0 / (1.0 + np.linalg.norm(res_emb - cent_res))
+            pear_sim = float(np.clip(np.corrcoef(res_emb, cent_res)[0, 1], -1.0, 1.0))
+            res_score = 0.65 * cos_sim + 0.25 * euc_sim + 0.10 * pear_sim
+
+            ecapa_score = None
+            if ENABLE_ECAPA and ecapa_emb is not None and c.get('ecapa_embedding') is not None:
+                ecapa_score = float(np.clip(np.dot(
+                    np.array(ecapa_emb, dtype=np.float64),
+                    np.array(c['ecapa_embedding'], dtype=np.float64)), -1.0, 1.0))
+
+            base = (ECAPA_WEIGHT * ecapa_score + (1 - ECAPA_WEIGHT) * res_score
+                    if ecapa_score is not None else res_score)
+
+            if use_plda and plda_manager and plda_manager.is_ready:
+                final = PLDA_SCORE_WEIGHT * plda_manager.score_prob(res_emb, cent_res) + (1 - PLDA_SCORE_WEIGHT) * base
+            else:
+                final = base
+
+            if score_norm_manager and score_norm_manager.is_ready:
+                final = score_norm_manager.normalize(final, test_emb=res_emb, enroll_emb=cent_res, speaker_id=speaker_id)
+
+            scores.append(final)
+            weights.append(c['quality_avg'] ** CENTROID_QUALITY_WEIGHT * np.log1p(c['sample_count']))
+
+        scores = np.array(scores)
+        weights = np.array(weights)
+        weights /= weights.sum()
+        return float(0.85 * scores.max() + 0.15 * np.average(scores, weights=weights))
+
+    def get_primary_centroid(self):
+        return max(self.centroids, key=lambda c: c['sample_count']) if self.centroids else None
+
+    def to_dict(self):
+        return {'centroids': self.centroids, 'total_samples': self.total_samples,
+                'metadata': self.metadata}
+
+    @classmethod
+    def from_dict(cls, data, max_centroids=MAX_CENTROIDS_PER_PROFILE):
+        obj = cls(max_centroids=max_centroids)
+        obj.centroids = data.get('centroids', [])
+        obj.total_samples = data.get('total_samples', 0)
+        obj.metadata = data.get('metadata', {
+            'created_at': datetime.now().isoformat(),
+            'last_updated': datetime.now().isoformat(),
+        })
+        return obj
 
 
-# =============================================================================
+# =========================================================================
 # ADAPTIVE THRESHOLD MANAGER
-# =============================================================================
+# =========================================================================
 
 class AdaptiveThresholdManager:
     def __init__(self):
-        self.similarity_threshold   = BASE_SIMILARITY_THRESHOLD
+        self.similarity_threshold = BASE_SIMILARITY_THRESHOLD
         self.strong_match_threshold = BASE_STRONG_MATCH_THRESHOLD
         self.verification_threshold = BASE_VERIFICATION_THRESHOLD
-        self.profile_thresholds:    dict = {}
-        self._adjustments:          list = []
-        self._load()
+        self.profile_thresholds = {}
+        self._load_state()
 
-    def _load(self):
+    def _load_state(self):
         if not ENABLE_ADAPTIVE_THRESHOLDS or not os.path.exists(THRESHOLD_STATE_PATH):
             return
         try:
-            with open(THRESHOLD_STATE_PATH, "rb") as fh:
-                s = pickle.load(fh)
-            self.similarity_threshold   = s.get("similarity_threshold",   BASE_SIMILARITY_THRESHOLD)
-            self.strong_match_threshold = s.get("strong_match_threshold", BASE_STRONG_MATCH_THRESHOLD)
-            self.verification_threshold = s.get("verification_threshold", BASE_VERIFICATION_THRESHOLD)
-            self.profile_thresholds     = s.get("profile_thresholds", {})
-            log.info("Thresholds loaded | base=%.3f", self.similarity_threshold)
-        except Exception as exc:
-            log.warning("Threshold load error: %s", exc)
+            with open(THRESHOLD_STATE_PATH, 'rb') as f:
+                state = pickle.load(f)
+            self.similarity_threshold = state.get('similarity_threshold', BASE_SIMILARITY_THRESHOLD)
+            self.strong_match_threshold = state.get('strong_match_threshold', BASE_STRONG_MATCH_THRESHOLD)
+            self.verification_threshold = state.get('verification_threshold', BASE_VERIFICATION_THRESHOLD)
+            self.profile_thresholds = state.get('profile_thresholds', {})
+        except Exception as e:
+            print(f"   Threshold load error: {e}")
 
-    def _save(self):
+    def _save_state(self):
         if not ENABLE_ADAPTIVE_THRESHOLDS:
             return
         try:
-            with open(THRESHOLD_STATE_PATH, "wb") as fh:
+            with open(THRESHOLD_STATE_PATH, 'wb') as f:
                 pickle.dump({
-                    "similarity_threshold":   self.similarity_threshold,
-                    "strong_match_threshold": self.strong_match_threshold,
-                    "verification_threshold": self.verification_threshold,
-                    "profile_thresholds":     self.profile_thresholds,
-                    "updated":                datetime.now().isoformat(),
-                }, fh, protocol=4)
-        except Exception as exc:
-            log.warning("Threshold save error: %s", exc)
+                    'similarity_threshold': self.similarity_threshold,
+                    'strong_match_threshold': self.strong_match_threshold,
+                    'verification_threshold': self.verification_threshold,
+                    'profile_thresholds': self.profile_thresholds,
+                }, f)
+        except Exception as e:
+            print(f"   Threshold save error: {e}")
 
-    def get_threshold(self, profile_id: int,
-                      total_recordings: int, num_centroids: int = 1) -> float:
+    def get_threshold_for_profile(self, profile_id, total_recordings, num_centroids=1):
         if not ENABLE_ADAPTIVE_THRESHOLDS:
             return self.similarity_threshold
         base = self.profile_thresholds.get(profile_id, self.similarity_threshold)
         if total_recordings >= PROFILE_MATURITY_THRESHOLD:
-            base += min((total_recordings - PROFILE_MATURITY_THRESHOLD) / 20.0, 0.10)
+            base += min((total_recordings - PROFILE_MATURITY_THRESHOLD) / 20.0, 0.08)
         if num_centroids > 2:
             base += min((num_centroids - 2) * 0.015, 0.05)
         return float(np.clip(base, THRESHOLD_MIN, THRESHOLD_MAX))
 
-    def analyze(self, all_sims: list, best_id) -> None:
-        if not ENABLE_ADAPTIVE_THRESHOLDS or len(all_sims) < 2:
-            return
-        top2 = sorted([s[0] for s in all_sims], reverse=True)[:2]
-        gap  = top2[0] - top2[1]
-        if gap > SIMILARITY_GAP_THRESHOLD and top2[0] > self.similarity_threshold + 0.05:
-            self._shift(THRESHOLD_STEP, f"high-conf gap={gap:.3f}")
-        elif gap < 0.05 and top2[0] < self.similarity_threshold + 0.03:
-            self._shift(-THRESHOLD_STEP, f"low-conf  gap={gap:.3f}")
-        n = self._db_count()
-        if n > 20:
-            target = BASE_SIMILARITY_THRESHOLD + min((n - 20) / 100.0, 0.08)
-            if self.similarity_threshold < target - 0.01:
-                self._shift(THRESHOLD_STEP, f"DB-scale n={n}")
+    def analyze_and_adjust(self, all_similarities, best_match_id):
+        pass  # Disabled - ENABLE_ADAPTIVE_THRESHOLDS = False
 
-    def on_match_confirmed(self, profile_id: int,
-                           similarity: float, was_correct: bool) -> None:
-        if not ENABLE_ADAPTIVE_THRESHOLDS:
-            return
-        cur = self.profile_thresholds.get(profile_id, self.similarity_threshold)
-        if was_correct and similarity < cur + 0.05:
-            new = cur - FALSE_REJECT_REWARD
-        elif not was_correct and similarity > cur:
-            new = cur + FALSE_ACCEPT_PENALTY
-        else:
-            return
-        self.profile_thresholds[profile_id] = float(np.clip(new, THRESHOLD_MIN, THRESHOLD_MAX))
-        self._save()
-
-    def _shift(self, delta: float, reason: str) -> None:
-        old = self.similarity_threshold
-        self.similarity_threshold = float(np.clip(old + delta, THRESHOLD_MIN, THRESHOLD_MAX))
-        if abs(self.similarity_threshold - old) < 1e-6:
-            return
-        self._adjustments.append((datetime.now().isoformat(), reason, delta))
-        if len(self._adjustments) > 100:
-            self._adjustments = self._adjustments[-100:]
-        r = self.similarity_threshold / old if old > 0 else 1.0
-        self.strong_match_threshold = float(
-            np.clip(self.strong_match_threshold * r, THRESHOLD_MIN + 0.05, THRESHOLD_MAX))
-        self.verification_threshold = float(
-            np.clip(self.verification_threshold * r, THRESHOLD_MIN + 0.02, THRESHOLD_MAX - 0.05))
-        self._save()
-        log.info("Threshold: %.3f -> %.3f  (%s)", old, self.similarity_threshold, reason)
-
-    def _db_count(self) -> int:
-        try:
-            with _db_lock:
-                conn = _get_conn()
-                n    = conn.execute("SELECT COUNT(*) FROM voice_profiles").fetchone()[0]
-                conn.close()
-            return n
-        except Exception:
-            return 0
+    def on_match_confirmed(self, profile_id, similarity, was_correct):
+        pass
 
 
 threshold_manager = AdaptiveThresholdManager()
 
 
-# =============================================================================
-# PLDA — Probabilistic Linear Discriminant Analysis
-# =============================================================================
+# =========================================================================
+# PLDA
+# =========================================================================
 
 class PLDA:
-    """
-    Full EM-trained PLDA with cached Cholesky inverses.
-    Scoring cost is O(D) after the one-time O(D^3) cache at train time.
-    """
+    def __init__(self, embedding_dim=PLDA_EMBEDDING_DIM, latent_dim=PLDA_LATENT_DIM):
+        self.embedding_dim = embedding_dim
+        self.latent_dim = latent_dim
+        self.mean = None
+        self.V = None
+        self.Sigma_w = None
+        self.is_trained = False
+        self._num_speakers_at_train = 0
+        self._llr_scale = 1.0
 
-    def __init__(self, embedding_dim: int = PLDA_EMBEDDING_DIM,
-                 latent_dim: int = PLDA_LATENT_DIM):
-        self.embedding_dim           = embedding_dim
-        self.latent_dim              = latent_dim
-        self.mean                    = None
-        self.V                       = None
-        self.Sw                      = None
-        self.is_trained              = False
-        self._n_speakers_trained     = 0
-        self._llr_scale              = 1.0
-        self._Sw_inv                 = None
-        self._Sigmas_inv             = None
-        self._logdet_w               = 0.0
-        self._logdet_s               = 0.0
-
-    # ── training ─────────────────────────────────────────────────────────
-
-    def train(self, speaker_embeddings: dict, n_iter: int = 10) -> None:
-        all_e = np.array([e for embs in speaker_embeddings.values()
-                          for e in embs], dtype=np.float64)
-        if all_e.shape[0] < 2:
+    def train(self, speaker_embeddings, n_iter=10):
+        all_embs = np.array([e for embs in speaker_embeddings.values() for e in embs], dtype=np.float64)
+        if all_embs.shape[0] < 2:
             return
-        D = all_e.shape[1]
-        self.mean = all_e.mean(axis=0)
-
+        D = all_embs.shape[1]
+        self.mean = all_embs.mean(axis=0)
         Sw = np.zeros((D, D), dtype=np.float64)
-        nt, sp_means = 0, {}
+        n_total = 0
+        speaker_means = {}
         for sid, embs in speaker_embeddings.items():
-            arr = np.asarray(embs, dtype=np.float64)
-            m   = arr.mean(axis=0)
-            sp_means[sid] = m
-            Sw += (arr - m).T @ (arr - m)
-            nt += len(embs)
-        Sw = Sw / max(nt, 1) + np.eye(D) * 1e-4
-
-        sp_mat   = np.asarray(list(sp_means.values()), dtype=np.float64) - self.mean
-        Sb       = (sp_mat.T @ sp_mat) / max(len(sp_means), 1)
-        ev, evec = np.linalg.eigh(Sb)
-        k        = min(self.latent_dim, D)
-        V        = evec[:, np.argsort(ev)[::-1][:k]].T.copy()
-        Sw_inv   = np.linalg.inv(Sw)
-
+            arr = np.array(embs, dtype=np.float64)
+            sp_mean = arr.mean(axis=0)
+            speaker_means[sid] = sp_mean
+            Sw += (arr - sp_mean).T @ (arr - sp_mean)
+            n_total += len(embs)
+        Sw = Sw / max(n_total, 1) + np.eye(D) * 1e-4
+        sp_mat = np.array(list(speaker_means.values()), dtype=np.float64) - self.mean
+        Sb = (sp_mat.T @ sp_mat) / max(len(speaker_means), 1)
+        eigvals, eigvecs = np.linalg.eigh(Sb)
+        k = min(self.latent_dim, D)
+        V = eigvecs[:, np.argsort(eigvals)[::-1][:k]].T.copy()
+        Sw_inv = np.linalg.inv(Sw)
         for _ in range(n_iter):
-            VSwi  = V @ Sw_inv
-            Ainv  = np.linalg.inv(np.eye(k) + VSwi @ V.T)
+            VSwi = V @ Sw_inv
+            Ainv = np.linalg.inv(np.eye(k) + VSwi @ V.T)
             Ez, EzzT = {}, {}
             for sid, embs in speaker_embeddings.items():
-                arr = np.asarray(embs, dtype=np.float64)
-                ms  = arr.mean(axis=0) - self.mean
-                ez  = Ainv @ (VSwi @ ms)
-                Ez[sid]   = ez
+                arr = np.array(embs, dtype=np.float64)
+                ms = arr.mean(axis=0) - self.mean
+                ez = Ainv @ (VSwi @ ms)
+                Ez[sid] = ez
                 EzzT[sid] = Ainv + np.outer(ez, ez) * len(embs)
-
-            nV   = np.zeros((k, D), dtype=np.float64)
-            dV   = np.zeros((k, k), dtype=np.float64)
-            Sw2  = np.zeros((D, D), dtype=np.float64)
-            nt   = 0
+            nV = np.zeros((k, D), dtype=np.float64)
+            dV = np.zeros((k, k), dtype=np.float64)
+            Sw2 = np.zeros((D, D), dtype=np.float64)
+            nt = 0
             for sid, embs in speaker_embeddings.items():
-                arr = np.asarray(embs, dtype=np.float64)
-                ni  = len(embs)
-                ms  = arr.mean(axis=0) - self.mean
-                ez  = Ez[sid]
-                nV  += ni * np.outer(ez, ms)
-                dV  += EzzT[sid]
-                Sw2 += (arr - (self.mean + V.T @ ez)).T \
-                       @ (arr - (self.mean + V.T @ ez))
-                nt  += ni
-
-            V      = np.linalg.inv(dV + np.eye(k) * 1e-6) @ nV
-            Sw     = Sw2 / max(nt, 1) + np.eye(D) * 1e-4
+                arr = np.array(embs, dtype=np.float64)
+                ni = len(embs)
+                ez = Ez[sid]
+                nV += ni * np.outer(ez, arr.mean(axis=0) - self.mean)
+                dV += EzzT[sid]
+                Sw2 += (arr - (self.mean + V.T @ ez)).T @ (arr - (self.mean + V.T @ ez))
+                nt += ni
+            V = np.linalg.inv(dV + np.eye(k) * 1e-6) @ nV
+            Sw = Sw2 / max(nt, 1) + np.eye(D) * 1e-4
             Sw_inv = np.linalg.inv(Sw)
+        self.V = V
+        self.Sigma_w = Sw
+        self.is_trained = True
+        self._num_speakers_at_train = len(speaker_embeddings)
+        self._llr_scale = self._calibrate_scale(speaker_embeddings)
+        print(f"   PLDA trained | speakers={len(speaker_embeddings)} | latent={k}")
 
-        self.V  = V
-        self.Sw = Sw
-        self.is_trained          = True
-        self._n_speakers_trained = len(speaker_embeddings)
-        self._llr_scale          = self._calibrate(speaker_embeddings)
-        self._cache_inv()
-        log.info("PLDA trained | speakers=%d | latent=%d | iters=%d | scale=%.3f",
-                 len(speaker_embeddings), k, n_iter, self._llr_scale)
-
-    def _cache_inv(self) -> None:
-        if not self.is_trained or self.V is None or self.Sw is None:
-            return
-        D = self.embedding_dim
-        try:
-            self._Sw_inv = np.linalg.solve(self.Sw, np.eye(D))
-            Ss           = self.Sw + self.V.T @ self.V
-            L            = np.linalg.cholesky(Ss + np.eye(D) * 1e-6)
-            self._Sigmas_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(D)))
-            _, self._logdet_w = np.linalg.slogdet(self.Sw)
-            _, self._logdet_s = np.linalg.slogdet(Ss)
-        except np.linalg.LinAlgError as exc:
-            log.warning("PLDA._cache_inv failed: %s — falling back to per-call inv", exc)
-            self._Sw_inv = self._Sigmas_inv = None
-
-    def _calibrate(self, speaker_embeddings: dict, n: int = 30) -> float:
+    def _calibrate_scale(self, speaker_embeddings, n=30):
         sids = list(speaker_embeddings.keys())
         if len(sids) < 2:
             return 1.0
-        rng  = np.random.default_rng(0)
+        rng = np.random.default_rng(0)
         llrs = []
         for _ in range(n):
-            s = rng.choice(sids); d = s
+            s = rng.choice(sids)
+            d = s
             while d == s:
                 d = rng.choice(sids)
             es = speaker_embeddings[s]
             i, j = rng.choice(len(es), 2, replace=(len(es) < 2))
-            llrs.append(abs(self._raw(es[i], es[j])))
-            llrs.append(abs(self._raw(es[0], speaker_embeddings[d][0])))
+            llrs.append(abs(self._raw_score(es[i], es[j])))
+            llrs.append(abs(self._raw_score(es[0], speaker_embeddings[d][0])))
         return max(float(np.median(llrs)), 1e-6)
 
-    def score(self, e1: np.ndarray, e2: np.ndarray) -> float:
-        return self._raw(e1, e2) / self._llr_scale
+    def score(self, e1, e2):
+        return self._raw_score(e1, e2) / self._llr_scale
 
-    def score_prob(self, e1: np.ndarray, e2: np.ndarray) -> float:
-        return _sigmoid(self.score(e1, e2))
-
-    def _raw(self, e1: np.ndarray, e2: np.ndarray) -> float:
-        if not self.is_trained or self.V is None or self.Sw is None:
+    def _raw_score(self, e1, e2):
+        if not self.is_trained:
             return 0.0
         x1 = e1.astype(np.float64) - self.mean
         x2 = e2.astype(np.float64) - self.mean
-
-        if self._Sw_inv is not None:
-            Si, Ssi = self._Sw_inv, self._Sigmas_inv
-            ldw, lds = self._logdet_w, self._logdet_s
-        else:
-            D   = self.embedding_dim
-            Si  = np.linalg.inv(self.Sw)
-            Ss  = self.Sw + self.V.T @ self.V
-            Ssi = np.linalg.inv(Ss + np.eye(D) * 1e-6)
-            _, ldw = np.linalg.slogdet(self.Sw)
-            _, lds = np.linalg.slogdet(Ss)
-
-        qd = (x1 @ Si @ x1 + x2 @ Si @ x2) * 0.5
-        qs = ((x1 - x2) @ Si @ (x1 - x2) + (x1 + x2) @ Ssi @ (x1 + x2)) * 0.25
+        D = self.embedding_dim
+        Sw_inv = np.linalg.inv(self.Sigma_w)
+        Ss = self.Sigma_w + self.V.T @ self.V
+        Ss_inv = np.linalg.inv(Ss + np.eye(D) * 1e-6)
+        _, ldw = np.linalg.slogdet(self.Sigma_w)
+        _, lds = np.linalg.slogdet(Ss)
+        qd = (x1 @ Sw_inv @ x1 + x2 @ Sw_inv @ x2) * 0.5
+        qs = ((x1 - x2) @ Sw_inv @ (x1 - x2) + (x1 + x2) @ Ss_inv @ (x1 + x2)) * 0.25
         return float((ldw - lds) + (qd - qs))
 
-    def save(self, path: str = PLDA_MODEL_PATH) -> None:
-        with open(path, "wb") as fh:
-            pickle.dump({
-                "embedding_dim": self.embedding_dim,
-                "latent_dim":    self.latent_dim,
-                "mean": self.mean, "V": self.V, "Sw": self.Sw,
-                "is_trained":    self.is_trained,
-                "n_speakers":    self._n_speakers_trained,
-                "llr_scale":     self._llr_scale,
-            }, fh, protocol=4)
+    @staticmethod
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x)) if x >= 0 else np.exp(x) / (1.0 + np.exp(x))
 
-    def load(self, path: str = PLDA_MODEL_PATH) -> bool:
+    def score_normalised(self, e1, e2):
+        return self.sigmoid(self.score(e1, e2))
+
+    def save(self, path=PLDA_MODEL_PATH):
+        with open(path, 'wb') as f:
+            pickle.dump({'embedding_dim': self.embedding_dim, 'latent_dim': self.latent_dim,
+                         'mean': self.mean, 'V': self.V, 'Sigma_w': self.Sigma_w,
+                         'is_trained': self.is_trained,
+                         'num_speakers': self._num_speakers_at_train,
+                         'llr_scale': self._llr_scale}, f)
+
+    def load(self, path=PLDA_MODEL_PATH):
         if not os.path.exists(path):
             return False
         try:
-            with open(path, "rb") as fh:
-                s = pickle.load(fh)
-            self.embedding_dim          = s["embedding_dim"]
-            self.latent_dim             = s["latent_dim"]
-            self.mean                   = s["mean"]
-            self.V                      = s["V"]
-            self.Sw                     = s.get("Sw") or s.get("Sigma_w")
-            self.is_trained             = s["is_trained"]
-            self._n_speakers_trained    = s.get("n_speakers", 0)
-            self._llr_scale             = s.get("llr_scale", 1.0)
-            self._cache_inv()
-            log.info("PLDA loaded | speakers_at_train=%d", self._n_speakers_trained)
+            with open(path, 'rb') as f:
+                s = pickle.load(f)
+            self.__dict__.update(s)
+            self._llr_scale = s.get('llr_scale', 1.0)
+            print(f"   PLDA loaded | speakers_at_train={s.get('num_speakers', 0)}")
             return True
-        except Exception as exc:
-            log.warning("PLDA load error: %s", exc)
+        except Exception as e:
+            print(f"   PLDA load error: {e}")
             return False
 
 
 class PLDAManager:
     def __init__(self):
-        self.plda   = PLDA()
-        self._since = 0
-        if ENABLE_PLDA and not self.plda.load():
-            self._retrain()
+        self.plda = PLDA()
+        self._profiles_since_last_train = 0
+        self._initialise()
 
-    def _retrain(self):
+    def _initialise(self):
+        if not ENABLE_PLDA:
+            return
+        if self.plda.load(PLDA_MODEL_PATH):
+            return
+        self.retrain()
+
+    def retrain(self):
         embs = _collect_all_embeddings_from_db()
         if len(embs) < PLDA_MIN_SPEAKERS:
             self.plda.is_trained = False
             return
         self.plda.train(embs)
-        self.plda.save()
-        self._since = 0
+        self.plda.save(PLDA_MODEL_PATH)
+        self._profiles_since_last_train = 0
 
     def on_new_profile(self):
-        self._since += 1
-        if self._since >= PLDA_RETRAIN_INTERVAL:
-            self._retrain()
+        self._profiles_since_last_train += 1
+        if self._profiles_since_last_train >= PLDA_RETRAIN_INTERVAL:
+            self.retrain()
 
     @property
-    def is_ready(self) -> bool:
+    def is_ready(self):
         return ENABLE_PLDA and self.plda.is_trained
 
-    def score_llr(self, e1, e2) -> float:
+    def score_llr(self, e1, e2):
         return self.plda.score(e1, e2) if self.is_ready else 0.0
 
-    def score_prob(self, e1, e2) -> float:
-        return self.plda.score_prob(e1, e2) if self.is_ready else 0.5
+    def score_prob(self, e1, e2):
+        return self.plda.score_normalised(e1, e2) if self.is_ready else 0.5
 
 
-# =============================================================================
-# SYSTEM INITIALISATION — models loaded once at import time
-# =============================================================================
+# =========================================================================
+# INITIALIZATION
+# =========================================================================
 
-log.info("VocalD v3 starting — WavLM + ECAPA + ResNet")
+print("Loading VocalD Voice Recognition System ...")
 
-# ── WavLM-Large ───────────────────────────────────────────────────────────
-wavlm_model     = None
-wavlm_extractor = None
-if HAS_WAVLM:
+encoder = None
+try:
+    encoder = VoiceEncoder()
+    print("Resemblyzer encoder loaded")
+except Exception as e:
+    print(f"Resemblyzer error: {e}")
+
+ecapa_classifier = None
+if ENABLE_ECAPA and EncoderClassifier is not None:
     try:
-        log.info("Loading WavLM-Large (~1.2 GB, first run downloads) ...")
-        _wlm_name       = "microsoft/wavlm-large"
-        wavlm_extractor = Wav2Vec2FeatureExtractor.from_pretrained(_wlm_name)
-        wavlm_model     = WavLMModel.from_pretrained(_wlm_name)
-        wavlm_model.eval()
-        log.info("WavLM-Large loaded  (1024-dim)")
-    except Exception as _exc:
-        log.error("WavLM load failed: %s", _exc)
-        wavlm_model = wavlm_extractor = None
-else:
-    log.warning("WavLM unavailable — pip install transformers torchaudio")
-
-# ── ECAPA-TDNN ────────────────────────────────────────────────────────────
-ecapa_model = None
-if EncoderClassifier is not None:
-    try:
-        log.info("Loading ECAPA-TDNN ...")
-        ecapa_model = EncoderClassifier.from_hparams(
+        print("Loading ECAPA-TDNN ...")
+        ecapa_classifier = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
             savedir="pretrained_models/spkrec-ecapa-voxceleb",
             run_opts={"device": "cpu"})
-        log.info("ECAPA-TDNN loaded  (192-dim)")
-    except Exception as _exc:
-        log.error("ECAPA load failed: %s", _exc)
+        print("ECAPA-TDNN loaded")
+    except Exception as e:
+        print(f"ECAPA-TDNN failed: {e}")
+        ecapa_classifier = None
+        ENABLE_ECAPA = False
+else:
+    ENABLE_ECAPA = False
 
-# ── ResNet ────────────────────────────────────────────────────────────────
-resnet_model = None
-if EncoderClassifier is not None:
-    try:
-        log.info("Loading ResNet speaker embedder ...")
-        resnet_model = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-resnet-voxceleb",
-            savedir="pretrained_models/spkrec-resnet-voxceleb",
-            run_opts={"device": "cpu"})
-        log.info("ResNet embedder loaded  (256-dim)")
-    except Exception as _exc:
-        log.error("ResNet load failed: %s", _exc)
-
-if wavlm_model is None and ecapa_model is None and resnet_model is None:
-    log.error(
-        "All three embedding models failed to load. "
-        "Check your internet connection and pip install transformers speechbrain."
-    )
-
-# ── PyAnnote diarization ──────────────────────────────────────────────────
-# FIX: allowlist TorchVersion for torch 2.5+ weights_only=True default
 diarization_pipeline = None
-if PyannotePipeline is not None:
-    if not HF_TOKEN:
-        log.warning("HUGGINGFACE_TOKEN not set — diarization unavailable. "
-                    "Add it to .env to enable multi-speaker support.")
+try:
+    hf_token = os.getenv('HUGGINGFACE_TOKEN')
+    if not hf_token:
+        print("No HUGGINGFACE_TOKEN set")
     else:
+        import torch.serialization
         try:
-            import torch.serialization
-            try:
-                from torch.torch_version import TorchVersion
-                torch.serialization.add_safe_globals([TorchVersion])
-                log.info("Registered TorchVersion as safe global for torch.load")
-            except Exception as _tv_exc:
-                log.warning("Could not register TorchVersion safe global: %s", _tv_exc)
+            from torch.torch_version import TorchVersion
+            torch.serialization.add_safe_globals([TorchVersion])
+            print("Registered TorchVersion as safe global")
+        except Exception as _tv_exc:
+            print(f"Could not register TorchVersion: {_tv_exc}")
 
-            diarization_pipeline = PyannotePipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=HF_TOKEN)
-            diarization_pipeline.to(torch.device("cpu"))
-            torch.set_num_threads(multiprocessing.cpu_count())
-            torch.set_grad_enabled(False)
-            log.info("PyAnnote 3.1 loaded  (%d CPU cores)", multiprocessing.cpu_count())
-        except Exception as _exc:
-            log.error("PyAnnote load failed: %s", _exc)
+        diarization_pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
+        diarization_pipeline.to(torch.device("cpu"))
+        num_cores = multiprocessing.cpu_count()
+        torch.set_num_threads(num_cores)
+        torch.set_grad_enabled(False)
+        print(f"PyAnnote 3.1 loaded ({num_cores} cores)")
+except Exception as e:
+    print(f"PyAnnote error: {e}")
 
-# ── VAD ───────────────────────────────────────────────────────────────────
-_vad = None
+vad = None
 if ENABLE_VAD:
     try:
-        _vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-        log.info("VAD enabled  (aggressiveness=%d)", VAD_AGGRESSIVENESS)
+        vad = webrtcvad.Vad(3)
+        print("VAD enabled")
     except Exception:
-        log.warning("webrtcvad not available — VAD disabled")
+        ENABLE_VAD = False
 
-# ── Backend managers ──────────────────────────────────────────────────────
-log.info("Initialising PLDA ...")
+print("Initialising PLDA ...")
 plda_manager = PLDAManager()
 
-log.info("Initialising WCCN ...")
+print("Initialising WCCN ...")
 wccn_manager = WCCNManager()
 
-log.info("Initialising ScoreNorm ...")
+print("Initialising Score Normalizer ...")
 score_norm_manager = ScoreNormManager()
 
-log.info("=" * 60)
-log.info("  WavLM-Large   : %s", "OK  (1024-dim)" if wavlm_model  else "MISSING")
-log.info("  ECAPA-TDNN    : %s", "OK  (192-dim)"  if ecapa_model  else "MISSING")
-log.info("  ResNet        : %s", "OK  (256-dim)"  if resnet_model else "MISSING")
-log.info("  Diarization   : %s", "OK" if diarization_pipeline else "MISSING (set HF token)")
-log.info("  PLDA          : %s", "trained" if plda_manager.is_ready  else "waiting for data")
-log.info("  WCCN          : %s", "trained" if wccn_manager.is_ready  else "waiting for data")
-log.info("  ScoreNorm     : %s", "trained" if score_norm_manager.is_ready else "waiting for data")
-log.info("  Mahalanobis   : %s", "on" if ENABLE_MAHALANOBIS else "off")
-log.info("  Daily retrain : %s", "on  (%02d:%02d)" % (DAILY_RETRAIN_HOUR, DAILY_RETRAIN_MINUTE)
-         if ENABLE_DAILY_RETRAINING and HAS_APSCHEDULER else "off")
-log.info("=" * 60)
+print("=" * 60)
+print(f"  Resemblyzer   : {'OK' if encoder else 'MISSING'}")
+print(f"  ECAPA-TDNN    : {'OK' if ecapa_classifier else 'disabled'}")
+print(f"  Diarization   : {'OK' if diarization_pipeline else 'MISSING'}")
+print(f"  PLDA          : {'trained' if plda_manager.is_ready else 'waiting for data'}")
+print(f"  WCCN          : {'trained' if wccn_manager.is_ready else 'waiting for data'}")
+print(f"  ScoreNorm     : {'trained' if score_norm_manager.is_ready else 'waiting for data'}")
+print(f"  Threshold     : {threshold_manager.similarity_threshold:.3f}")
+print("=" * 60)
 
 
-# =============================================================================
-# AUDIO UTILITY FUNCTIONS
-# =============================================================================
+# =========================================================================
+# AUDIO PROCESSING FUNCTIONS
+# =========================================================================
 
-def _apply_vad(wav: np.ndarray) -> np.ndarray:
-    """Strip non-speech frames using WebRTC VAD."""
-    if not ENABLE_VAD or _vad is None:
+def _convert_to_wav(audio_path):
+    """Convert any audio to WAV using ffmpeg for consistent processing."""
+    ext = os.path.splitext(audio_path)[1].lower()
+    if ext == '.wav':
+        return audio_path, False
+    try:
+        import subprocess
+        fd, wav_path = tempfile.mkstemp(suffix='.wav')
+        os.close(fd)
+        result = subprocess.run(
+            ['ffmpeg', '-i', audio_path, '-ar', '16000', '-ac', '1', '-y', wav_path],
+            capture_output=True, timeout=60)
+        if result.returncode == 0 and os.path.exists(wav_path):
+            return wav_path, True
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+        return audio_path, False
+    except Exception as e:
+        print(f"ffmpeg conversion failed: {e}")
+        return audio_path, False
+
+
+def apply_vad(wav, sample_rate=SAMPLE_RATE):
+    if not ENABLE_VAD or vad is None:
         return wav
     try:
-        frame_ms  = 30
-        frame_len = int(SAMPLE_RATE * frame_ms / 1000)
-        i16       = (np.clip(wav, -1.0, 1.0) * 32767).astype(np.int16)
-        kept      = [
-            wav[i: i + frame_len]
-            for i in range(0, len(i16) - frame_len, frame_len)
-            if _vad.is_speech(i16[i: i + frame_len].tobytes(), SAMPLE_RATE)
-        ]
-        return np.concatenate(kept) if kept else wav
-    except Exception as exc:
-        log.debug("VAD error: %s", exc)
+        wav_int16 = (np.clip(wav, -1.0, 1.0) * 32767).astype(np.int16)
+        frame_length = int(sample_rate * 30 / 1000)
+        speech_frames = []
+        for i in range(0, len(wav_int16) - frame_length, frame_length):
+            if vad.is_speech(wav_int16[i:i + frame_length].tobytes(), sample_rate):
+                speech_frames.append(wav[i:i + frame_length])
+        return np.concatenate(speech_frames) if speech_frames else wav
+    except Exception as e:
+        print(f"VAD error: {e}")
         return wav
 
 
-def _noise_filter(wav: np.ndarray) -> np.ndarray:
-    """DC removal, bandpass filter, Gaussian smoothing, normalise."""
+def advanced_noise_filter(wav, sample_rate=SAMPLE_RATE):
     try:
-        wav = wav - wav.mean()
-        mx  = np.abs(wav).max()
+        wav = wav - np.mean(wav)
+        mx = np.max(np.abs(wav))
         if mx > 0:
             wav = wav / mx
         if not ENABLE_NOISE_FILTERING:
             return wav
-        ny = SAMPLE_RATE / 2.0
-        lo = LOW_FREQ_CUTOFF / ny
-        if 0.0 < lo < 1.0:
-            b, a = butter(5, lo, btype="high")
-            wav  = filtfilt(b, a, wav)
-        hi = HIGH_FREQ_CUTOFF / ny
-        if 0.0 < hi < 1.0:
-            b, a = butter(5, hi, btype="low")
-            wav  = filtfilt(b, a, wav)
+        nyquist = sample_rate / 2.0
+        lo = LOW_FREQ_CUTOFF / nyquist
+        if 0 < lo < 1.0:
+            b, a = butter(5, lo, btype='high')
+            wav = filtfilt(b, a, wav)
+        hi = HIGH_FREQ_CUTOFF / nyquist
+        if 0 < hi < 1.0:
+            b, a = butter(5, hi, btype='low')
+            wav = filtfilt(b, a, wav)
         wav = gaussian_filter1d(wav, sigma=0.8)
-        mx  = np.abs(wav).max()
+        mx = np.max(np.abs(wav))
         return wav / mx if mx > 0 else wav
-    except Exception as exc:
-        log.debug("Noise filter error: %s", exc)
-        wav = wav - wav.mean()
-        mx  = np.abs(wav).max()
+    except Exception as e:
+        print(f"Filtering error: {e}")
+        wav = wav - np.mean(wav)
+        mx = np.max(np.abs(wav))
         return wav / mx if mx > 0 else wav
 
 
-def _audio_quality(wav: np.ndarray) -> float:
-    """Estimate recording quality in [0, 1]."""
-    if not ENABLE_QUALITY_SCORING or len(wav) < SAMPLE_RATE:
+def calculate_audio_quality(wav, sample_rate=SAMPLE_RATE):
+    if not ENABLE_QUALITY_SCORING or len(wav) < sample_rate:
         return 1.0
     try:
-        nn         = min(int(0.2 * SAMPLE_RATE), len(wav) // 4)
-        noise_pwr  = float(np.mean(wav[:nn] ** 2)) + 1e-10
-        speech_pwr = float(np.mean(wav[nn:] ** 2)) + 1e-10
-
-        if noise_pwr > speech_pwr * 0.5:
-            snr_score = float(np.clip(np.std(wav) / 0.10, 0.0, 1.0))
+        nn = min(int(0.2 * sample_rate), len(wav) // 4)
+        noise_pwr = np.mean(wav[:nn] ** 2) + 1e-10
+        sig_pwr = np.mean(wav[nn:] ** 2) + 1e-10
+        if noise_pwr > sig_pwr * 0.5:
+            snr_score = float(np.clip(np.std(wav) / 0.10, 0, 1))
         else:
-            snr       = 10.0 * np.log10(speech_pwr / noise_pwr)
-            snr_score = float(np.clip((snr - 5.0) / 20.0, 0.0, 1.0))
-
-        dr_score   = float(np.clip(np.std(wav) / 0.15, 0.0, 1.0))
-        clip_score = 1.0 - float(np.clip(
-            np.sum(np.abs(wav) > 0.95) / len(wav) * 50.0, 0.0, 1.0))
-        zcr        = float(np.sum(np.abs(np.diff(np.sign(wav)))) / len(wav))
-        zcr_score  = float(np.clip(zcr / 0.1, 0.0, 1.0))
-
+            snr = 10 * np.log10(sig_pwr / noise_pwr)
+            snr_score = float(np.clip((snr - 5) / 20, 0, 1))
+        dr_score = float(np.clip(np.std(wav) / 0.15, 0, 1))
+        clip_score = 1.0 - float(np.clip(np.sum(np.abs(wav) > 0.95) / len(wav) * 50, 0, 1))
+        zcr_score = float(np.clip(np.sum(np.abs(np.diff(np.sign(wav)))) / len(wav) / 0.1, 0, 1))
         return 0.40 * snr_score + 0.25 * dr_score + 0.25 * clip_score + 0.10 * zcr_score
     except Exception:
         return 0.5
 
 
-def _classify_gender(wav: np.ndarray) -> str:
-    """Estimate speaker gender via F0 median."""
-    if not ENABLE_GENDER_CLASSIFICATION or len(wav) < SAMPLE_RATE:
-        return "unknown"
+def classify_gender(wav, sample_rate=SAMPLE_RATE):
+    if not ENABLE_GENDER_CLASSIFICATION or len(wav) < sample_rate:
+        return 'unknown'
     try:
-        f0 = librosa.yin(wav, fmin=75, fmax=400, sr=SAMPLE_RATE)
-        v  = f0[f0 > 75]
-        if len(v) < 10:
-            return "unknown"
-        m = float(np.median(v))
-        return "male" if m < 145 else ("female" if m > 165 else "unknown")
+        f0 = librosa.yin(wav, fmin=75, fmax=400, sr=sample_rate)
+        f0_v = f0[f0 > 75]
+        if len(f0_v) < 10:
+            return 'unknown'
+        med = np.median(f0_v)
+        return 'male' if med < 145 else ('female' if med > 165 else 'unknown')
     except Exception:
-        return "unknown"
+        return 'unknown'
 
 
-def _project_to_dim(emb: np.ndarray, target_dim: int = PLDA_EMBEDDING_DIM) -> np.ndarray:
-    """Project any embedding to target_dim deterministically."""
-    e = np.asarray(emb, dtype=np.float64).ravel()
-    d = target_dim
-    if len(e) == d:
-        return e
-    if len(e) > d:
-        while len(e) > d:
-            half   = len(e) // 2
-            rest   = len(e) - half
-            minlen = min(half, rest)
-            e      = (e[:minlen] + e[len(e) - minlen:]) / np.sqrt(2.0)
-        e = e[:d]
-    else:
-        out       = np.zeros(d, dtype=np.float64)
-        out[:len(e)] = e
-        e         = out
-    n = np.linalg.norm(e)
-    return e / n if n > 1e-8 else e
-
-
-def _encode_speechbrain(model, wav: np.ndarray):
-    """Run a SpeechBrain EncoderClassifier on a 16 kHz waveform."""
+def extract_ecapa_embedding(wav, sample_rate=SAMPLE_RATE):
+    if not ENABLE_ECAPA or ecapa_classifier is None:
+        return None
     try:
-        t = torch.FloatTensor(wav).unsqueeze(0)
+        if sample_rate != 16000:
+            wav = librosa.resample(wav, orig_sr=sample_rate, target_sr=16000)
         with torch.no_grad():
-            emb = model.encode_batch(t).squeeze().cpu().numpy()
-        n = float(np.linalg.norm(emb))
-        return (emb / (n + 1e-8)).astype(np.float64) if n > 1e-8 else None
-    except Exception as exc:
-        log.debug("SpeechBrain encode error: %s", exc)
+            emb = ecapa_classifier.encode_batch(
+                torch.FloatTensor(wav).unsqueeze(0)).squeeze().cpu().numpy()
+        n = np.linalg.norm(emb)
+        return emb / (n + 1e-8) if n > 1e-8 else emb
+    except Exception as e:
+        print(f"ECAPA error: {e}")
         return None
 
 
-def _encode_wavlm(wav: np.ndarray):
-    """Extract mean-pooled WavLM-Large speaker embedding (1024-dim)."""
-    if wavlm_model is None or wavlm_extractor is None:
-        return None
-    try:
-        inputs = wavlm_extractor(
-            wav, sampling_rate=SAMPLE_RATE,
-            return_tensors="pt", padding=True)
-        with torch.no_grad():
-            out = wavlm_model(**inputs)
-        emb = out.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
-        n   = float(np.linalg.norm(emb))
-        return (emb / (n + 1e-8)).astype(np.float64) if n > 1e-8 else None
-    except Exception as exc:
-        log.debug("WavLM encode error: %s", exc)
-        return None
-
-
-# =============================================================================
-# HELPERS
-# =============================================================================
-
-def _get_fused(data) -> np.ndarray:
-    """Extract the primary fused embedding vector from any stored format."""
-    if isinstance(data, dict):
-        emb = data.get("fused_embedding")
-        if emb is None:
-            emb = data.get("resemblyzer_embedding")
-        if emb is None:
-            emb = data.get("embedding")
-    else:
-        emb = data
-    return np.asarray(emb, dtype=np.float64).ravel()
-
-
-def _to_centroid(stored) -> VoiceProfileCentroid:
-    """Always return a VoiceProfileCentroid regardless of stored format."""
-    if isinstance(stored, dict) and "centroids" in stored:
-        return VoiceProfileCentroid.from_dict(stored)
-    obj = VoiceProfileCentroid(max_centroids=1)
-    obj.add_embedding(stored, quality=1.0, duration=1.0)
-    return obj
-
-
-def _sigmoid(x: float) -> float:
-    if x >= 0:
-        return 1.0 / (1.0 + np.exp(-x))
-    ex = np.exp(x)
-    return ex / (1.0 + ex)
-
-
-# =============================================================================
-# MAHALANOBIS DISTANCE CACHE
-# =============================================================================
-
-_mahal_inv_cov = None
-_mahal_cache_n: int = 0
-_mahal_lock         = threading.Lock()
-
-
-def _get_inv_cov():
-    """Return regularised inverse covariance; rebuilt only when DB grows."""
-    global _mahal_inv_cov, _mahal_cache_n
-    if not ENABLE_MAHALANOBIS:
+def extract_voice_embedding(audio_path, start_time=None, end_time=None):
+    if encoder is None:
         return None
     try:
-        with _db_lock:
-            conn  = _get_conn()
-            count = conn.execute("SELECT COUNT(*) FROM voice_profiles").fetchone()[0]
-            conn.close()
-    except Exception:
-        return _mahal_inv_cov
-    if count < 5:
-        return None
-    if count == _mahal_cache_n and _mahal_inv_cov is not None:
-        return _mahal_inv_cov
-    with _mahal_lock:
-        if count == _mahal_cache_n and _mahal_inv_cov is not None:
-            return _mahal_inv_cov
-        vecs = [e for embs in _collect_all_embeddings_from_db().values()
-                for e in embs]
-        if len(vecs) < 10:
-            return None
-        X = np.asarray(vecs, dtype=np.float64)
+        # Convert to WAV first for consistent processing
+        wav_path, converted = _convert_to_wav(audio_path)
         try:
-            _mahal_inv_cov = np.linalg.inv(
-                np.cov(X.T) + np.eye(X.shape[1]) * 1e-4)
-            _mahal_cache_n = count
-        except np.linalg.LinAlgError:
-            _mahal_inv_cov = None
-    return _mahal_inv_cov
-
-
-def _mahal_sim(a: np.ndarray, b: np.ndarray, ic: np.ndarray) -> float:
-    d = a.astype(np.float64) - b.astype(np.float64)
-    return float(1.0 / (1.0 + np.sqrt(max(float(d @ ic @ d), 0.0))))
-
-
-# =============================================================================
-# CORE FUNCTION 1 — extract_voice_embedding()
-# =============================================================================
-
-def extract_voice_embedding(audio_path: str,
-                             start_time=None,
-                             end_time=None):
-    """
-    Extract a fused 256-dim speaker embedding from an audio file or segment.
-    Returns dict or None if audio is too short or all models fail.
-    """
-    try:
-        wav, _ = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True,
-                              dtype=np.float32)
-        wav    = wav.astype(np.float64)
+            wav = preprocess_wav(Path(wav_path))
+        finally:
+            if converted and os.path.exists(wav_path):
+                os.remove(wav_path)
 
         if start_time is not None and end_time is not None:
             s = max(0, int(start_time * SAMPLE_RATE))
@@ -1441,612 +1060,90 @@ def extract_voice_embedding(audio_path: str,
             if s >= e:
                 return None
             wav = wav[s:e]
+            if len(wav) < int(MIN_SEGMENT_DURATION * SAMPLE_RATE):
+                return None
 
-        if len(wav) < int(MIN_SEGMENT_DURATION * SAMPLE_RATE):
-            return None
+        if ENABLE_VAD:
+            wav = apply_vad(wav)
+            if len(wav) < int(MIN_SEGMENT_DURATION * SAMPLE_RATE):
+                return None
 
-        wav = _apply_vad(wav.astype(np.float32)).astype(np.float64)
-        if len(wav) < int(MIN_SEGMENT_DURATION * SAMPLE_RATE):
-            return None
+        wav_clean = advanced_noise_filter(wav)
+        quality = calculate_audio_quality(wav_clean)
+        gender = classify_gender(wav_clean)
 
-        wav     = _noise_filter(wav)
-        quality = _audio_quality(wav)
-        gender  = _classify_gender(wav)
-
-        wav_f32 = wav.astype(np.float32)
-
-        wavlm_emb  = _encode_wavlm(wav_f32)
-        ecapa_emb  = _encode_speechbrain(ecapa_model,  wav_f32) \
-                     if ecapa_model  is not None else None
-        resnet_emb = _encode_speechbrain(resnet_model, wav_f32) \
-                     if resnet_model is not None else None
-
-        if wavlm_emb is None and ecapa_emb is None and resnet_emb is None:
-            log.warning("All models returned None for %s", audio_path)
-            return None
-
-        w_wlm = WAVLM_WEIGHT  if wavlm_emb  is not None else 0.0
-        w_eca = ECAPA_WEIGHT  if ecapa_emb  is not None else 0.0
-        w_rsn = RESNET_WEIGHT if resnet_emb is not None else 0.0
-        total = w_wlm + w_eca + w_rsn
-
-        fused = np.zeros(PLDA_EMBEDDING_DIM, dtype=np.float64)
-        if wavlm_emb  is not None:
-            fused += (w_wlm / total) * _project_to_dim(wavlm_emb)
-        if ecapa_emb  is not None:
-            fused += (w_eca / total) * _project_to_dim(ecapa_emb)
-        if resnet_emb is not None:
-            fused += (w_rsn / total) * _project_to_dim(resnet_emb)
-
-        n = np.linalg.norm(fused)
-        fused /= (n + 1e-8)
+        res_emb = encoder.embed_utterance(wav_clean)
+        res_emb = res_emb / (np.linalg.norm(res_emb) + 1e-8)
+        ecapa_emb = extract_ecapa_embedding(wav_clean, SAMPLE_RATE)
 
         return {
-            "fused_embedding":  fused,
-            "ecapa_embedding":  ecapa_emb,
-            "resnet_embedding": resnet_emb,
-            "wavlm_embedding":  wavlm_emb,
-            "quality":          float(quality),
-            "gender":           gender,
-            "duration":         float(len(wav) / SAMPLE_RATE),
+            'resemblyzer_embedding': res_emb,
+            'ecapa_embedding': ecapa_emb,
+            'quality': quality,
+            'gender': gender,
+            'duration': len(wav) / SAMPLE_RATE,
         }
-
-    except Exception as exc:
-        log.error("extract_voice_embedding(%s): %s", audio_path, exc)
+    except Exception as e:
+        print(f"Embedding extraction error: {e}")
         return None
 
 
-# =============================================================================
-# VERIFICATION
-# =============================================================================
-
-def verify_speaker_match(embedding_data: dict, profile_id: int):
-    """Secondary verification gate — three independent checks."""
-    try:
-        with _db_lock:
-            conn = _get_conn()
-            row  = conn.execute(
-                "SELECT embedding, total_recordings FROM voice_profiles WHERE id=?",
-                (profile_id,)
-            ).fetchone()
-            conn.close()
-
-        if not row:
-            return False, 0.0
-
-        stored   = pickle.loads(row[0])
-        total    = int(row[1])
-        cobj     = _to_centroid(stored)
-        num_cent = len(cobj.centroids)
-
-        sim = cobj.best_score(
-            embedding_data,
-            plda_mgr=plda_manager,
-            wccn_mgr=wccn_manager,
-            norm_mgr=score_norm_manager,
-            speaker_id=profile_id,
-        )
-        thr = threshold_manager.get_threshold(profile_id, total, num_cent)
-
-        new_f = _get_fused(embedding_data)
-        prim  = cobj.primary()
-        old_f = _get_fused(prim) if prim is not None else new_f
-
-        if wccn_manager.is_ready:
-            new_f = wccn_manager.transform(new_f)
-            old_f = wccn_manager.transform(old_f)
-
-        cos_ok  = float(np.clip(new_f @ old_f, -1.0, 1.0)) >= 0.55
-        euc_ok  = (1.0 / (1.0 + np.linalg.norm(new_f - old_f))) >= 0.50
-        plda_ok = (plda_manager.score_llr(new_f, old_f) >= 0.0) \
-                  if plda_manager.is_ready else True
-
-        passed = sim >= thr and cos_ok and euc_ok and plda_ok
-        return passed, float(sim)
-
-    except Exception as exc:
-        log.error("verify_speaker_match(id=%d): %s", profile_id, exc)
-        return False, 0.0
-
-
-# =============================================================================
-# CORE FUNCTION 2 — find_matching_speaker()
-# =============================================================================
-
-def find_matching_speaker(embedding_data: dict):
-    """Identify the best matching speaker profile."""
-    try:
-        with _db_lock:
-            conn     = _get_conn()
-            profiles = conn.execute(
-                "SELECT id, name, embedding, total_recordings FROM voice_profiles"
-            ).fetchall()
-            conn.close()
-    except Exception as exc:
-        log.error("find_matching_speaker DB read: %s", exc)
-        return None
-
-    if not profiles:
-        return None
-
-    inv_cov = _get_inv_cov()
-    fused_t = _get_fused(embedding_data)
-    if wccn_manager.is_ready:
-        fused_t = wccn_manager.transform(fused_t)
-
-    all_sims  = []
-    best_match = None
-    best_sim   = 0.0
-
-    for pid, name, blob, total_rec in profiles:
-        try:
-            stored = pickle.loads(blob)
-        except Exception:
-            continue
-
-        cobj     = _to_centroid(stored)
-        num_cent = len(cobj.centroids)
-
-        cosine_score = cobj.best_score(
-            embedding_data,
-            plda_mgr=plda_manager,
-            wccn_mgr=wccn_manager,
-            norm_mgr=score_norm_manager,
-            speaker_id=pid,
-        )
-
-        mahal_score = 0.0
-        if inv_cov is not None:
-            prim = cobj.primary()
-            if prim is not None:
-                cf = np.asarray(prim["fused_embedding"], dtype=np.float64)
-                if wccn_manager.is_ready:
-                    cf = wccn_manager.transform(cf)
-                mahal_score = _mahal_sim(fused_t, cf, inv_cov)
-
-        if inv_cov is not None:
-            denom    = ENSEMBLE_COSINE_WEIGHT + ENSEMBLE_MAHAL_WEIGHT
-            ensemble = (ENSEMBLE_COSINE_WEIGHT * cosine_score
-                        + ENSEMBLE_MAHAL_WEIGHT * mahal_score) / denom
-        else:
-            ensemble = cosine_score
-
-        all_sims.append((float(ensemble), pid, name))
-        threshold = threshold_manager.get_threshold(pid, total_rec, num_cent)
-
-        if ensemble > threshold and ensemble > best_sim:
-            verified, vsim = verify_speaker_match(embedding_data, pid)
-            if verified:
-                best_sim   = float(ensemble)
-                best_match = {
-                    "id":            pid,
-                    "name":          name,
-                    "confidence":    round(float(ensemble) * 100, 2),
-                    "similarity":    float(ensemble),
-                    "verified":      True,
-                    "num_centroids": num_cent,
-                }
-
-    threshold_manager.analyze(all_sims, best_match["id"] if best_match else None)
-    return best_match
-
-
-# =============================================================================
-# CORE FUNCTION 3 — daily_model_update()
-# =============================================================================
-
-def daily_model_update(force: bool = False) -> dict:
-    """Retrain PLDA, WCCN, and ScoreNorm from all current DB data."""
-    t0  = time.time()
-    ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log.info("=" * 60)
-    log.info("DAILY MODEL UPDATE  —  %s", ts)
-    log.info("=" * 60)
-
-    result = {
-        "plda_retrained":       False,
-        "wccn_retrained":       False,
-        "score_norm_retrained": False,
-        "num_speakers":         0,
-        "duration_seconds":     0.0,
-        "timestamp":            datetime.now().isoformat(),
-    }
-
-    embs = _collect_all_embeddings_from_db()
-    n    = len(embs)
-    result["num_speakers"] = n
-    log.info("Speakers in DB: %d", n)
-
-    if n >= PLDA_MIN_SPEAKERS or force:
-        try:
-            log.info("Retraining PLDA ...")
-            plda_manager.plda.train(embs)
-            plda_manager.plda.save()
-            plda_manager.plda._cache_inv()
-            plda_manager._since = 0
-            result["plda_retrained"] = True
-            log.info("PLDA retrained OK")
-        except Exception as exc:
-            log.error("PLDA retrain failed: %s", exc)
-    else:
-        log.info("PLDA skipped (need >=%d, have %d)", PLDA_MIN_SPEAKERS, n)
-
-    qualified = {sid: ev for sid, ev in embs.items()
-                 if len(ev) >= WCCN_MIN_SAMPLES_PER_SPEAKER}
-    if len(qualified) >= WCCN_MIN_SPEAKERS or force:
-        try:
-            log.info("Retraining WCCN ...")
-            wccn_manager.wccn.train(embs)
-            wccn_manager.wccn.save()
-            wccn_manager._since = 0
-            global _mahal_cache_n
-            _mahal_cache_n = 0
-            result["wccn_retrained"] = True
-            log.info("WCCN retrained OK")
-        except Exception as exc:
-            log.error("WCCN retrain failed: %s", exc)
-    else:
-        log.info("WCCN skipped (need >=%d qualified speakers)", WCCN_MIN_SPEAKERS)
-
-    if n >= SCORE_NORM_MIN_SPEAKERS or force:
-        try:
-            log.info("Retraining ScoreNorm ...")
-            score_norm_manager.normalizer.train(embs)
-            score_norm_manager.normalizer.save()
-            score_norm_manager._since = 0
-            result["score_norm_retrained"] = True
-            log.info("ScoreNorm retrained OK")
-        except Exception as exc:
-            log.error("ScoreNorm retrain failed: %s", exc)
-    else:
-        log.info("ScoreNorm skipped (need >=%d, have %d)",
-                 SCORE_NORM_MIN_SPEAKERS, n)
-
-    result["duration_seconds"] = round(time.time() - t0, 2)
-    log.info(
-        "Update complete in %.1fs | PLDA=%s WCCN=%s SN=%s",
-        result["duration_seconds"],
-        result["plda_retrained"],
-        result["wccn_retrained"],
-        result["score_norm_retrained"],
-    )
-    log.info("=" * 60)
-    return result
-
-
-# ── Schedule daily retraining ──────────────────────────────────────────────
-_scheduler = None
-if ENABLE_DAILY_RETRAINING and HAS_APSCHEDULER:
-    try:
-        _scheduler = BackgroundScheduler(daemon=True)
-        _scheduler.add_job(
-            daily_model_update,
-            trigger="cron",
-            hour=DAILY_RETRAIN_HOUR,
-            minute=DAILY_RETRAIN_MINUTE,
-            id="daily_model_update",
-            replace_existing=True,
-        )
-        _scheduler.start()
-        log.info("Daily retraining scheduled at %02d:%02d",
-                 DAILY_RETRAIN_HOUR, DAILY_RETRAIN_MINUTE)
-    except Exception as exc:
-        log.warning("APScheduler start failed: %s", exc)
-
-
-# =============================================================================
-# DATABASE OPERATIONS
-# =============================================================================
-
-def create_voice_profile(name: str, embedding_data: dict):
-    """Create a new speaker profile. Returns the new profile id."""
-    try:
-        now = datetime.now().isoformat()
-        if ENABLE_MULTI_CENTROID:
-            obj = VoiceProfileCentroid()
-            obj.add_embedding(
-                embedding_data,
-                quality=float(embedding_data.get("quality", 1.0)),
-                duration=float(embedding_data.get("duration", 1.0)),
-            )
-            stored = obj.to_dict()
-        else:
-            stored = embedding_data
-
-        with _db_lock:
-            conn = _get_conn()
-            conn.execute(
-                "INSERT INTO voice_profiles "
-                "(name, embedding, first_seen, last_seen, total_recordings) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (name, pickle.dumps(stored, protocol=4), now, now, 1),
-            )
-            pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-            conn.commit()
-            conn.close()
-
-        plda_manager.on_new_profile()
-        wccn_manager.on_new_profile()
-        score_norm_manager.on_new_profile()
-        global _mahal_cache_n
-        _mahal_cache_n = 0
-
-        log.info("Created profile | id=%d  name='%s'", pid, name)
-        return pid
-
-    except Exception as exc:
-        log.error("create_voice_profile: %s", exc)
-        return None
-
-
-def update_voice_profile(profile_id: int, new_data: dict) -> None:
-    """Add new embedding data to an existing profile."""
-    try:
-        with _db_lock:
-            conn = _get_conn()
-            row  = conn.execute(
-                "SELECT embedding, total_recordings FROM voice_profiles WHERE id=?",
-                (profile_id,)
-            ).fetchone()
-            if not row:
-                conn.close()
-                return
-
-            stored = pickle.loads(row[0])
-            total  = int(row[1])
-
-            if ENABLE_MULTI_CENTROID:
-                obj = _to_centroid(stored)
-                obj.add_embedding(
-                    new_data,
-                    quality=float(new_data.get("quality", 1.0)),
-                    duration=float(new_data.get("duration", 1.0)),
-                )
-                refined = obj.to_dict()
-            else:
-                alpha  = (max(ADAPTIVE_LEARNING_RATE[0],
-                              min(1.0 / (total + 1), ADAPTIVE_LEARNING_RATE[1]))
-                          * float(new_data.get("quality", 1.0)))
-                old_f  = _get_fused(stored)
-                new_f  = _get_fused(new_data)
-                merged = (1 - alpha) * old_f + alpha * new_f
-                merged /= (np.linalg.norm(merged) + 1e-8)
-                refined = {
-                    "fused_embedding": merged,
-                    "ecapa_embedding": new_data.get("ecapa_embedding"),
-                    "quality":         float(new_data.get("quality", 1.0)),
-                    "gender":          new_data.get("gender", "unknown"),
-                }
-
-            conn.execute(
-                "UPDATE voice_profiles "
-                "SET last_seen=?, total_recordings=total_recordings+1, embedding=? "
-                "WHERE id=?",
-                (datetime.now().isoformat(), pickle.dumps(refined, protocol=4), profile_id),
-            )
-            conn.commit()
-            conn.close()
-
-    except Exception as exc:
-        log.error("update_voice_profile(id=%d): %s", profile_id, exc)
-
-
-def rename_speaker(profile_id: int, new_name: str) -> bool:
-    """Rename an existing speaker profile."""
-    try:
-        with _db_lock:
-            conn = _get_conn()
-            conn.execute(
-                "UPDATE voice_profiles SET name=? WHERE id=?",
-                (new_name, profile_id))
-            conn.commit()
-            conn.close()
-        log.info("Renamed profile id=%d to '%s'", profile_id, new_name)
-        return True
-    except Exception as exc:
-        log.error("rename_speaker: %s", exc)
-        return False
-
-
-def delete_speaker(profile_id: int) -> bool:
-    """Delete a speaker profile from the database."""
-    try:
-        with _db_lock:
-            conn = _get_conn()
-            conn.execute("DELETE FROM voice_profiles WHERE id=?", (profile_id,))
-            conn.commit()
-            conn.close()
-        global _mahal_cache_n
-        _mahal_cache_n = 0
-        log.info("Deleted profile id=%d", profile_id)
-        return True
-    except Exception as exc:
-        log.error("delete_speaker: %s", exc)
-        return False
-
-
-def list_speakers() -> list:
-    """Return all speaker profiles as a list of dicts."""
-    try:
-        with _db_lock:
-            conn = _get_conn()
-            rows = conn.execute(
-                "SELECT id, name, first_seen, last_seen, total_recordings "
-                "FROM voice_profiles ORDER BY name"
-            ).fetchall()
-            conn.close()
-        return [
-            {"id": r[0], "name": r[1], "first_seen": r[2],
-             "last_seen": r[3], "total_recordings": r[4]}
-            for r in rows
-        ]
-    except Exception as exc:
-        log.error("list_speakers: %s", exc)
-        return []
-
-
-# =============================================================================
-# SEGMENT PROCESSING
-# =============================================================================
-
-def _merge_segments(segments: list, gap_s: float = 0.15) -> list:
-    """Merge adjacent diarization segments separated by less than gap_s seconds."""
-    if not segments:
-        return segments
-    segs   = sorted(segments, key=lambda x: x["start"])
-    merged = [dict(segs[0])]
-    for s in segs[1:]:
-        if s["start"] - merged[-1]["end"] <= gap_s:
-            merged[-1]["end"]      = s["end"]
-            merged[-1]["duration"] = merged[-1]["end"] - merged[-1]["start"]
-        else:
-            merged.append(dict(s))
-    return merged
-
-
-def _process_speaker_segments(args: tuple):
-    """Worker — extract and average embeddings for one diarized speaker."""
-    label, info, audio_path = args
-    total_dur = float(info["total_duration"])
-
-    segs = _merge_segments(info["segments"])
-    segs = sorted(segs, key=lambda x: x["duration"], reverse=True)
-    segs = segs[:MAX_SEGMENTS_PER_SPEAKER]
-
-    embs:    list = []
-    weights: list = []
-
-    for seg in segs:
-        if seg["duration"] < MIN_SEGMENT_DURATION:
-            continue
-        e = extract_voice_embedding(audio_path, seg["start"], seg["end"])
-        if e is not None:
-            embs.append(e)
-            weights.append(seg["duration"] * float(e.get("quality", 1.0)))
-
-    if not embs:
-        return None
-
-    if len(embs) > 3:
-        fvecs = np.array([e["fused_embedding"] for e in embs], dtype=np.float64)
-        med   = np.median(fvecs, axis=0)
-        dists = [float(np.linalg.norm(v - med)) for v in fvecs]
-        md    = float(np.median(dists))
-        keep  = [(e, w) for e, w, d in zip(embs, weights, dists)
-                 if d < md * OUTLIER_REJECTION_FACTOR]
-        if keep:
-            embs, weights = map(list, zip(*keep))
-
-    wn   = np.asarray(weights, dtype=np.float64)
-    wn   = wn / wn.sum()
-
-    avgf = np.average(
-        np.array([e["fused_embedding"] for e in embs], dtype=np.float64),
-        axis=0, weights=wn)
-    avgf /= (np.linalg.norm(avgf) + 1e-8)
-
-    avg_ecapa = None
-    ecapa_pairs = [(e["ecapa_embedding"], w)
-                   for e, w in zip(embs, wn)
-                   if e.get("ecapa_embedding") is not None]
-    if ecapa_pairs:
-        evecs, ews = zip(*ecapa_pairs)
-        ews        = np.asarray(ews, dtype=np.float64)
-        ews        = ews / ews.sum()
-        avg_ecapa  = np.average(
-            np.array(list(evecs), dtype=np.float64), axis=0, weights=ews)
-        avg_ecapa /= (np.linalg.norm(avg_ecapa) + 1e-8)
-
-    genders = [e.get("gender", "unknown") for e in embs]
-    mode_g  = max(set(genders), key=genders.count)
-
-    return {
-        "label":   label,
-        "embedding": {
-            "fused_embedding":  avgf,
-            "ecapa_embedding":  avg_ecapa,
-            "quality":          float(np.mean([e.get("quality", 1.0) for e in embs])),
-            "gender":           mode_g,
-            "duration":         total_dur,
-        },
-        "duration":       total_dur,
-        "num_embeddings": len(embs),
-    }
-
-
-# =============================================================================
-# DIARIZATION
-# =============================================================================
-
-def _safe_tmpfile(audio_path: str) -> str:
-    """Create a unique temp WAV path."""
-    suffix = Path(audio_path).stem[:20]
-    fd, path = tempfile.mkstemp(prefix=f"vocald_{suffix}_", suffix=".wav")
-    os.close(fd)
-    return path
-
-
-def perform_smart_diarization(audio_path: str):
-    """Run PyAnnote diarization with automatic two-strategy fallback."""
+def perform_smart_diarization(audio_path):
     if diarization_pipeline is None:
         return None
-
     tmp = None
     try:
-        log.info("Diarizing: %s", Path(audio_path).name)
-        y, sr    = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True, dtype=np.float32)
-        duration = float(len(y) / sr)
-        log.info("Duration: %.1f s", duration)
+        print(f"Diarizing: {Path(audio_path).name}")
+        y, sr = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
+        duration = len(y) / sr
+        print(f"Duration: {duration:.1f}s")
 
-        tmp = _safe_tmpfile(audio_path)
-        sf.write(tmp, y, SAMPLE_RATE, subtype="PCM_16")
+        fd, tmp = tempfile.mkstemp(prefix='vocald_diar_', suffix='.wav')
+        os.close(fd)
+        sf.write(tmp, y, SAMPLE_RATE, subtype='PCM_16')
 
         with torch.no_grad():
+            print("  Strategy 1: unconstrained detection ...")
             out = diarization_pipeline(tmp)
 
-        spk: dict = {}
-        for seg, _, lbl in out.itertracks(yield_label=True):
-            spk.setdefault(lbl, []).append({
-                "start":    seg.start,
-                "end":      seg.end,
-                "duration": seg.end - seg.start,
+        # FIX: PyAnnote 3.1 returns Annotation directly
+        speakers_data = {}
+        for segment, _, label in out.itertracks(yield_label=True):
+            speakers_data.setdefault(label, []).append({
+                'start': segment.start, 'end': segment.end,
+                'duration': segment.end - segment.start,
             })
-        log.info("Strategy 1: %d speaker(s)", len(spk))
+        print(f"  Strategy 1: {len(speakers_data)} speaker(s)")
 
         needs_retry = (
-            (len(spk) == 1 and duration > 15)
-            or (duration > 180 and len(spk) < 3)
+            (len(speakers_data) == 1 and duration > 15) or
+            (duration > 180 and len(speakers_data) < 3)
         )
         if needs_retry:
-            log.info("Strategy 2: forcing min_speakers=2 ...")
+            print("  Strategy 2: forcing min_speakers=2 ...")
             with torch.no_grad():
                 out = diarization_pipeline(tmp, min_speakers=2, max_speakers=20)
-            spk = {}
-            for seg, _, lbl in out.itertracks(yield_label=True):
-                spk.setdefault(lbl, []).append({
-                    "start":    seg.start,
-                    "end":      seg.end,
-                    "duration": seg.end - seg.start,
+            speakers_data = {}
+            for segment, _, label in out.itertracks(yield_label=True):
+                speakers_data.setdefault(label, []).append({
+                    'start': segment.start, 'end': segment.end,
+                    'duration': segment.end - segment.start,
                 })
-            log.info("Strategy 2: %d speaker(s)", len(spk))
+            print(f"  Strategy 2: {len(speakers_data)} speaker(s)")
 
         filtered = {
-            lbl: {
-                "segments":       segs,
-                "total_duration": sum(s["duration"] for s in segs),
-            }
-            for lbl, segs in spk.items()
-            if sum(s["duration"] for s in segs) >= MIN_SPEAKING_TIME
+            lbl: {'segments': segs, 'total_duration': sum(s['duration'] for s in segs)}
+            for lbl, segs in speakers_data.items()
+            if sum(s['duration'] for s in segs) >= MIN_SPEAKING_TIME
         }
-        log.info("After duration filter: %d speaker(s)", len(filtered))
+        print(f"After duration filter: {len(filtered)} speaker(s)")
         return filtered or None
 
-    except Exception as exc:
-        log.error("perform_smart_diarization: %s", exc)
+    except Exception as e:
+        print(f"Diarization error: {e}")
         import traceback
         traceback.print_exc()
         return None
-
     finally:
         if tmp and os.path.exists(tmp):
             try:
@@ -2055,146 +1152,388 @@ def perform_smart_diarization(audio_path: str):
                 pass
 
 
-# =============================================================================
-# MAIN PIPELINE — process_audio_file()
-# =============================================================================
+# =========================================================================
+# SIMILARITY & MATCHING
+# =========================================================================
 
-def process_audio_file(audio_path: str, filename: str) -> list:
-    """Full pipeline: diarize -> embed -> identify/enroll each speaker."""
-    log.info("=" * 60)
-    log.info("PROCESSING: %s", filename)
-    log.info("=" * 60)
-    t0       = time.time()
-    speakers: list = []
-    stem     = Path(filename).stem
+def _extract_resemblyzer(data):
+    if isinstance(data, dict):
+        emb = data.get('resemblyzer_embedding')
+        if emb is None:
+            emb = data.get('embedding', data)
+        return np.array(emb, dtype=np.float64)
+    return np.array(data, dtype=np.float64)
 
+
+def find_matching_speaker(embedding_data):
     try:
-        spk_data = perform_smart_diarization(audio_path)
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        profiles = conn.execute(
+            'SELECT id, name, embedding, total_recordings FROM voice_profiles').fetchall()
+        conn.close()
+        if not profiles:
+            return None
 
-        if not spk_data:
-            log.info("Single-speaker mode (no diarization output)")
-            emb = extract_voice_embedding(audio_path)
+        all_sims = []
+        best_match, best_sim = None, 0.0
 
-            if emb is None:
-                return [{"speaker_index": 0, "name": f"Unknown ({stem})",
-                         "confidence": 0.0, "voice_profile_id": None}]
-
-            if emb["duration"] < MIN_PROFILE_DURATION:
-                log.warning("Audio too short: %.1f s < %.1f s",
-                            emb["duration"], MIN_PROFILE_DURATION)
-                return [{"speaker_index": 0, "name": f"Too Short ({stem})",
-                         "confidence": 0.0, "voice_profile_id": None}]
-
-            match = find_matching_speaker(emb)
-            if match:
-                log.info("MATCHED: %s  (%.1f%%)", match["name"], match["confidence"])
-                speakers.append({
-                    "speaker_index":    0,
-                    "name":             match["name"],
-                    "confidence":       round(match["confidence"], 1),
-                    "voice_profile_id": match["id"],
-                })
-                if (match["verified"]
-                        and match["similarity"]
-                        >= threshold_manager.strong_match_threshold):
-                    update_voice_profile(match["id"], emb)
+        for pid, name, blob, total_recordings in profiles:
+            stored = pickle.loads(blob)
+            if isinstance(stored, dict) and 'centroids' in stored:
+                obj = VoiceProfileCentroid.from_dict(stored)
+                sim = obj.get_best_match_score(
+                    embedding_data, use_plda=True,
+                    plda_manager=plda_manager,
+                    wccn_manager=wccn_manager,
+                    score_norm_manager=score_norm_manager,
+                    speaker_id=pid)
+                num_centroids = len(obj.centroids)
             else:
-                name = f"Speaker {stem}"
-                pid  = create_voice_profile(name, emb)
-                log.info("NEW profile: '%s'  id=%s", name, pid)
-                speakers.append({
-                    "speaker_index":    0,
-                    "name":             name,
-                    "confidence":       95.0,
-                    "voice_profile_id": pid,
-                })
+                sim = _calculate_similarity_legacy(embedding_data, stored)
+                num_centroids = 1
 
-        else:
-            log.info("Multi-speaker: %d speaker(s) detected", len(spk_data))
+            all_sims.append((sim, pid, name))
+            threshold = threshold_manager.get_threshold_for_profile(pid, total_recordings, num_centroids)
 
-            args  = [
-                (lbl, info, audio_path)
-                for lbl, info in sorted(
-                    spk_data.items(),
-                    key=lambda x: x[1]["total_duration"],
-                    reverse=True,
-                )
-            ]
-            max_w = min(len(args), multiprocessing.cpu_count())
+            if sim > threshold and sim > best_sim:
+                verified, vsim = _verify_speaker_match(embedding_data, pid)
+                if verified:
+                    best_sim = sim
+                    best_match = {
+                        'id': pid, 'name': name,
+                        'confidence': sim * 100,
+                        'similarity': sim, 'verified': True,
+                        'num_centroids': num_centroids,
+                    }
 
-            with ThreadPoolExecutor(max_workers=max_w) as pool:
-                future_map = {
-                    pool.submit(_process_speaker_segments, a): a[0]
-                    for a in args
-                }
-                raw_results = [f.result() for f in as_completed(future_map)]
+        threshold_manager.analyze_and_adjust(all_sims, best_match['id'] if best_match else None)
+        return best_match
 
-            results = sorted(
-                [r for r in raw_results if r is not None],
-                key=lambda x: x["duration"],
-                reverse=True,
-            )
-
-            idx = 0
-            for result in results:
-                emb = result["embedding"]
-                if result["duration"] < MIN_PROFILE_DURATION:
-                    log.info("  %s: %.1f s — too short, skipping",
-                             result["label"], result["duration"])
-                    continue
-
-                log.info("  %s: %.1f s  (%d segs)  gender=%s  q=%.0f%%",
-                         result["label"], result["duration"],
-                         result["num_embeddings"],
-                         emb.get("gender", "?"),
-                         emb.get("quality", 0) * 100)
-
-                match = find_matching_speaker(emb)
-                if match:
-                    log.info("  -> MATCHED: %s  (%.1f%%)",
-                             match["name"], match["confidence"])
-                    speakers.append({
-                        "speaker_index":    idx,
-                        "name":             match["name"],
-                        "confidence":       round(match["confidence"], 1),
-                        "voice_profile_id": match["id"],
-                    })
-                    if (match["verified"]
-                            and match["similarity"]
-                            >= threshold_manager.strong_match_threshold):
-                        update_voice_profile(match["id"], emb)
-                else:
-                    name = f"Speaker {idx + 1}"
-                    pid  = create_voice_profile(name, emb)
-                    log.info("  -> NEW: '%s'  id=%s", name, pid)
-                    speakers.append({
-                        "speaker_index":    idx,
-                        "name":             name,
-                        "confidence":       95.0,
-                        "voice_profile_id": pid,
-                    })
-                idx += 1
-
-    except Exception as exc:
-        log.error("process_audio_file error: %s", exc)
+    except Exception as e:
+        print(f"Error finding match: {e}")
         import traceback
         traceback.print_exc()
-        return [{"speaker_index": 0, "name": f"Error ({stem})",
-                 "confidence": 0.0, "voice_profile_id": None}]
-
-    log.info("COMPLETED: %d speaker(s) in %.1f s", len(speakers), time.time() - t0)
-    return speakers
+        return None
 
 
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
+def _calculate_similarity_legacy(emb1_data, emb2_data):
+    r1 = _extract_resemblyzer(emb1_data)
+    r2 = _extract_resemblyzer(emb2_data)
+    if wccn_manager.is_ready:
+        r1 = wccn_manager.transform(r1)
+        r2 = wccn_manager.transform(r2)
+    cos = float(np.clip(np.dot(r1, r2), -1.0, 1.0))
+    euc = 1.0 / (1.0 + np.linalg.norm(r1 - r2))
+    pear = float(np.clip(np.corrcoef(r1, r2)[0, 1], -1.0, 1.0)) if len(r1) > 1 else cos
+    res_score = 0.65 * cos + 0.25 * euc + 0.10 * pear
+    ecapa_score = None
+    if ENABLE_ECAPA and isinstance(emb1_data, dict) and isinstance(emb2_data, dict):
+        e1 = emb1_data.get('ecapa_embedding')
+        e2 = emb2_data.get('ecapa_embedding')
+        if e1 is not None and e2 is not None:
+            ecapa_score = float(np.clip(np.dot(
+                np.array(e1, dtype=np.float64), np.array(e2, dtype=np.float64)), -1.0, 1.0))
+    base = (ECAPA_WEIGHT * ecapa_score + (1 - ECAPA_WEIGHT) * res_score
+            if ecapa_score is not None else res_score)
+    if plda_manager.is_ready:
+        final = PLDA_SCORE_WEIGHT * plda_manager.score_prob(r1, r2) + (1 - PLDA_SCORE_WEIGHT) * base
+    else:
+        final = base
+    if score_norm_manager.is_ready:
+        final = score_norm_manager.normalize(final, test_emb=r1)
+    if isinstance(emb1_data, dict) and isinstance(emb2_data, dict):
+        g1 = emb1_data.get('gender', 'unknown')
+        g2 = emb2_data.get('gender', 'unknown')
+        if g1 != 'unknown' and g2 != 'unknown' and g1 != g2:
+            final *= 0.85
+    return float(final)
+
+
+def _verify_speaker_match(embedding_data, profile_id):
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        row = conn.execute(
+            'SELECT embedding, total_recordings FROM voice_profiles WHERE id=?',
+            (profile_id,)).fetchone()
+        conn.close()
+        if not row:
+            return False, 0.0
+
+        stored = pickle.loads(row[0])
+        total = row[1]
+
+        if isinstance(stored, dict) and 'centroids' in stored:
+            obj = VoiceProfileCentroid.from_dict(stored)
+            sim = obj.get_best_match_score(
+                embedding_data, use_plda=True,
+                plda_manager=plda_manager,
+                wccn_manager=wccn_manager,
+                score_norm_manager=score_norm_manager,
+                speaker_id=profile_id)
+            num_centroids = len(obj.centroids)
+            primary = obj.get_primary_centroid()
+        else:
+            sim = _calculate_similarity_legacy(embedding_data, stored)
+            num_centroids = 1
+            primary = stored
+
+        threshold = threshold_manager.get_threshold_for_profile(profile_id, total, num_centroids)
+        r_new = _extract_resemblyzer(embedding_data)
+        r_old = _extract_resemblyzer(primary)
+        if wccn_manager.is_ready:
+            r_new = wccn_manager.transform(r_new)
+            r_old = wccn_manager.transform(r_old)
+
+        cos_ok = float(np.clip(np.dot(r_new, r_old), -1.0, 1.0)) >= 0.72
+        euc_ok = (1.0 / (1.0 + np.linalg.norm(r_new - r_old))) >= 0.65
+        plda_ok = (plda_manager.score_llr(r_new, r_old) >= 0.0) if plda_manager.is_ready else True
+
+        return sim >= threshold and cos_ok and euc_ok and plda_ok, sim
+
+    except Exception as e:
+        print(f"Verification error: {e}")
+        return False, 0.0
+
+
+# =========================================================================
+# DATABASE OPERATIONS
+# =========================================================================
+
+def create_voice_profile(name, embedding_data):
+    try:
+        now = datetime.now().isoformat()
+        if ENABLE_MULTI_CENTROID:
+            obj = VoiceProfileCentroid(max_centroids=MAX_CENTROIDS_PER_PROFILE)
+            quality = embedding_data.get('quality', 1.0) if isinstance(embedding_data, dict) else 1.0
+            duration = embedding_data.get('duration', 1.0) if isinstance(embedding_data, dict) else 1.0
+            obj.add_embedding(embedding_data, quality, duration)
+            stored_data = obj.to_dict()
+        else:
+            stored_data = embedding_data
+
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        conn.execute(
+            'INSERT INTO voice_profiles (name, embedding, first_seen, last_seen, total_recordings) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (name, pickle.dumps(stored_data), now, now, 1))
+        pid = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        plda_manager.on_new_profile()
+        wccn_manager.on_new_profile()
+        score_norm_manager.on_new_profile()
+        print(f"Created profile | id={pid} name='{name}'")
+        return pid
+    except Exception as e:
+        print(f"Error creating profile: {e}")
+        return None
+
+
+def update_voice_profile(profile_id, new_embedding_data):
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        row = conn.execute(
+            'SELECT embedding, total_recordings FROM voice_profiles WHERE id=?',
+            (profile_id,)).fetchone()
+        if not row:
+            conn.close()
+            return
+        old_data = pickle.loads(row[0])
+        total = row[1]
+        quality = new_embedding_data.get('quality', 1.0) if isinstance(new_embedding_data, dict) else 1.0
+        duration = new_embedding_data.get('duration', 1.0) if isinstance(new_embedding_data, dict) else 1.0
+
+        if ENABLE_MULTI_CENTROID:
+            if isinstance(old_data, dict) and 'centroids' in old_data:
+                obj = VoiceProfileCentroid.from_dict(old_data)
+            else:
+                obj = VoiceProfileCentroid()
+                obj.add_embedding(old_data, 1.0, 1.0)
+            obj.add_embedding(new_embedding_data, quality, duration)
+            refined = obj.to_dict()
+        else:
+            alpha = max(ADAPTIVE_LEARNING_RATE[0],
+                        min(1.0 / (total + 1), ADAPTIVE_LEARNING_RATE[1])) * quality
+            old_r = _extract_resemblyzer(old_data)
+            new_r = _extract_resemblyzer(new_embedding_data)
+            refined_r = (1 - alpha) * old_r + alpha * new_r
+            refined_r /= (np.linalg.norm(refined_r) + 1e-8)
+            refined = {'resemblyzer_embedding': refined_r, 'quality': quality,
+                       'gender': new_embedding_data.get('gender', 'unknown') if isinstance(new_embedding_data, dict) else 'unknown'}
+
+        conn.execute(
+            'UPDATE voice_profiles SET last_seen=?, total_recordings=total_recordings+1, embedding=? WHERE id=?',
+            (datetime.now().isoformat(), pickle.dumps(refined), profile_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error updating profile: {e}")
+
+
+# =========================================================================
+# SEGMENT PROCESSING
+# =========================================================================
+
+def merge_close_segments(segments, gap=0.15):
+    if not segments:
+        return segments
+    segs = sorted(segments, key=lambda x: x['start'])
+    merged = [segs[0].copy()]
+    for s in segs[1:]:
+        if s['start'] - merged[-1]['end'] <= gap:
+            merged[-1]['end'] = s['end']
+            merged[-1]['duration'] = merged[-1]['end'] - merged[-1]['start']
+        else:
+            merged.append(s.copy())
+    return merged
+
+
+def process_speaker_parallel(args):
+    speaker_label, speaker_info, audio_path = args
+    total_duration = speaker_info['total_duration']
+    merged = merge_close_segments(speaker_info['segments'])
+    top_segs = sorted(merged, key=lambda x: x['duration'], reverse=True)[:MAX_SEGMENTS_PER_SPEAKER]
+
+    embeddings_data, weights = [], []
+    for seg in top_segs:
+        if seg['duration'] < MIN_SEGMENT_DURATION:
+            continue
+        emb = extract_voice_embedding(audio_path, seg['start'], seg['end'])
+        if emb:
+            embeddings_data.append(emb)
+            weights.append(seg['duration'] * emb.get('quality', 1.0))
+
+    if not embeddings_data:
+        return None
+
+    if len(embeddings_data) > 3:
+        vecs = np.array([e['resemblyzer_embedding'] for e in embeddings_data])
+        med = np.median(vecs, axis=0)
+        dists = [np.linalg.norm(v - med) for v in vecs]
+        med_d = np.median(dists)
+        keep = [(e, w) for e, w, d in zip(embeddings_data, weights, dists)
+                if d < med_d * OUTLIER_REJECTION_FACTOR]
+        if keep:
+            embeddings_data, weights = zip(*keep)
+            embeddings_data, weights = list(embeddings_data), list(weights)
+
+    w_total = sum(weights)
+    w_norm = [w / w_total for w in weights]
+    avg_r = np.average([e['resemblyzer_embedding'] for e in embeddings_data], axis=0, weights=w_norm)
+    avg_r /= (np.linalg.norm(avg_r) + 1e-8)
+
+    avg_e = None
+    if ENABLE_ECAPA:
+        pairs = [(e['ecapa_embedding'], wn) for e, wn in zip(embeddings_data, w_norm)
+                 if e.get('ecapa_embedding') is not None]
+        if pairs:
+            vecs, ws = zip(*pairs)
+            ws_arr = np.array(ws); ws_arr /= ws_arr.sum()
+            avg_e = np.average(list(vecs), axis=0, weights=ws_arr)
+            avg_e /= (np.linalg.norm(avg_e) + 1e-8)
+
+    genders = [e.get('gender', 'unknown') for e in embeddings_data]
+    return {
+        'label': speaker_label,
+        'embedding': {
+            'resemblyzer_embedding': avg_r,
+            'ecapa_embedding': avg_e,
+            'quality': float(np.mean([e.get('quality', 1.0) for e in embeddings_data])),
+            'gender': max(set(genders), key=genders.count),
+            'duration': total_duration,
+        },
+        'duration': total_duration,
+        'num_embeddings': len(embeddings_data),
+    }
+
+
+# =========================================================================
+# MAIN PROCESSING
+# =========================================================================
+
+def process_audio_file(audio_path, filename):
+    try:
+        print(f"\n{'='*60}")
+        print(f"PROCESSING: {filename}")
+        print(f"{'='*60}")
+        t0 = time.time()
+        stem = Path(filename).stem
+        speakers_data = perform_smart_diarization(audio_path)
+        speakers = []
+
+        if not speakers_data:
+            print("Single-speaker mode")
+            emb_data = extract_voice_embedding(audio_path)
+            if emb_data is None:
+                return [{'speaker_index': 0, 'name': f"Unknown ({stem})",
+                         'confidence': 0.0, 'voice_profile_id': None}]
+            if emb_data.get('duration', 0) < MIN_PROFILE_DURATION:
+                return [{'speaker_index': 0, 'name': f"Too Short ({stem})",
+                         'confidence': 0.0, 'voice_profile_id': None}]
+            match = find_matching_speaker(emb_data)
+            if match:
+                print(f"MATCHED: {match['name']} ({match['confidence']:.1f}%)")
+                speakers.append({'speaker_index': 0, 'name': match['name'],
+                                 'confidence': round(match['confidence'], 1),
+                                 'voice_profile_id': match['id']})
+                if match.get('verified') and match['similarity'] >= threshold_manager.strong_match_threshold:
+                    update_voice_profile(match['id'], emb_data)
+            else:
+                name = f"Speaker {stem}"
+                pid = create_voice_profile(name, emb_data)
+                print(f"NEW profile: '{name}' id={pid}")
+                speakers.append({'speaker_index': 0, 'name': name,
+                                 'confidence': 95.0, 'voice_profile_id': pid})
+
+        else:
+            print(f"Multi-speaker: {len(speakers_data)} speaker(s)")
+            args = [(lbl, info, audio_path)
+                    for lbl, info in sorted(speakers_data.items(),
+                                            key=lambda x: x[1]['total_duration'], reverse=True)]
+            max_w = min(len(args), multiprocessing.cpu_count())
+            with ThreadPoolExecutor(max_workers=max_w) as ex:
+                future_map = {ex.submit(process_speaker_parallel, a): a[0] for a in args}
+                results = [f.result() for f in as_completed(future_map)]
+
+            results = sorted([r for r in results if r], key=lambda x: x['duration'], reverse=True)
+            idx = 0
+            for result in results:
+                emb_data = result['embedding']
+                if result['duration'] < MIN_PROFILE_DURATION:
+                    print(f"  {result['label']}: {result['duration']:.1f}s - too short, skipping")
+                    continue
+                print(f"  {result['label']}: {result['duration']:.1f}s "
+                      f"({result['num_embeddings']} segs) "
+                      f"gender={emb_data.get('gender','?')} "
+                      f"q={emb_data.get('quality', 0)*100:.0f}%")
+                match = find_matching_speaker(emb_data)
+                if match:
+                    print(f"  -> MATCHED: {match['name']} ({match['confidence']:.1f}%)")
+                    speakers.append({'speaker_index': idx, 'name': match['name'],
+                                     'confidence': round(match['confidence'], 1),
+                                     'voice_profile_id': match['id']})
+                    if match.get('verified') and match['similarity'] >= threshold_manager.strong_match_threshold:
+                        update_voice_profile(match['id'], emb_data)
+                else:
+                    name = f"Speaker {idx + 1}"
+                    pid = create_voice_profile(name, emb_data)
+                    print(f"  -> NEW: '{name}' id={pid}")
+                    speakers.append({'speaker_index': idx, 'name': name,
+                                     'confidence': 95.0, 'voice_profile_id': pid})
+                idx += 1
+
+        print(f"\nCOMPLETED: {len(speakers)} speaker(s) in {time.time() - t0:.1f}s")
+        return speakers
+
+    except Exception as e:
+        print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return [{'speaker_index': 0, 'name': f"Error ({Path(filename).stem})",
+                 'confidence': 0.0, 'voice_profile_id': None}]
+
 
 if __name__ == "__main__":
-    log.info("VocalD v3 ready.")
-    log.info("Quick-start:")
-    log.info("  daily_model_update(force=True)")
-    log.info("  emb      = extract_voice_embedding('clip.wav')")
-    log.info("  match    = find_matching_speaker(emb)")
-    log.info("  speakers = process_audio_file('meeting.wav', 'meeting.wav')")
-    log.info("  print(list_speakers())")
+    print("VocalD ready.")
+    print(f"Threshold: {threshold_manager.similarity_threshold:.3f}")
