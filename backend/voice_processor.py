@@ -248,9 +248,11 @@ def _collect_all_embeddings_from_db() -> dict:
                     if emb is not None:
                         embeddings.append(np.asarray(emb, dtype=np.float64))
             elif isinstance(data, dict):
-                emb = (data.get("fused_embedding")
-                       or data.get("resemblyzer_embedding")
-                       or data.get("embedding"))
+                emb = data.get("fused_embedding")
+                if emb is None:
+                    emb = data.get("resemblyzer_embedding")
+                if emb is None:
+                    emb = data.get("embedding")
                 if emb is not None:
                     embeddings.append(np.asarray(emb, dtype=np.float64))
             else:
@@ -1344,9 +1346,11 @@ def _encode_wavlm(wav: np.ndarray):
 def _get_fused(data) -> np.ndarray:
     """Extract the primary fused embedding vector from any stored format."""
     if isinstance(data, dict):
-        emb = (data.get("fused_embedding")
-               or data.get("resemblyzer_embedding")
-               or data.get("embedding"))
+        emb = data.get("fused_embedding")
+        if emb is None:
+            emb = data.get("resemblyzer_embedding")
+        if emb is None:
+            emb = data.get("embedding")
     else:
         emb = data
     return np.asarray(emb, dtype=np.float64).ravel()
@@ -2001,7 +2005,7 @@ def perform_smart_diarization(audio_path: str):
             out = diarization_pipeline(tmp)
 
         spk: dict = {}
-        for seg, _, lbl in out.speaker_diarization.itertracks(yield_label=True):
+        for seg, _, lbl in out.itertracks(yield_label=True):
             spk.setdefault(lbl, []).append({
                 "start":    seg.start,
                 "end":      seg.end,
@@ -2018,7 +2022,7 @@ def perform_smart_diarization(audio_path: str):
             with torch.no_grad():
                 out = diarization_pipeline(tmp, min_speakers=2, max_speakers=20)
             spk = {}
-            for seg, _, lbl in out.speaker_diarization.itertracks(yield_label=True):
+            for seg, _, lbl in out.itertracks(yield_label=True):
                 spk.setdefault(lbl, []).append({
                     "start":    seg.start,
                     "end":      seg.end,
