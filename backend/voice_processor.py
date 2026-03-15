@@ -179,7 +179,7 @@ ENSEMBLE_MAHAL_WEIGHT  = 0.15
 
 # Audio processing
 ENABLE_VAD                   = True
-VAD_AGGRESSIVENESS           = 3       # 0–3; 3 = most aggressive
+VAD_AGGRESSIVENESS           = 3       # 0-3; 3 = most aggressive
 ENABLE_GENDER_CLASSIFICATION = True
 ENABLE_QUALITY_SCORING       = True
 OUTLIER_REJECTION_FACTOR     = 2.0
@@ -345,7 +345,7 @@ class ScoreNormalizer:
         self.is_trained          = True
         self._n_speakers_trained = n
         log.info("ScoreNorm trained | method=%s | speakers=%d | "
-                 "imp=%.3f±%.3f  tgt=%.3f±%.3f",
+                 "imp=%.3f+-%.3f  tgt=%.3f+-%.3f",
                  self.method, n,
                  self.impostor_mean, self.impostor_std,
                  self.target_mean,   self.target_std)
@@ -458,8 +458,8 @@ class ScoreNormManager:
 
 class WCCN:
     def __init__(self):
-        self.W:    np.ndarray | None = None
-        self.mean: np.ndarray | None = None
+        self.W    = None
+        self.mean = None
         self.is_trained              = False
         self._n_speakers_trained     = 0
 
@@ -647,7 +647,7 @@ class VoiceProfileCentroid:
         wt_arr = wt_arr / wt_arr.sum()
         return float(0.85 * sc_arr.max() + 0.15 * np.average(sc_arr, weights=wt_arr))
 
-    def primary(self) -> dict | None:
+    def primary(self):
         return max(self.centroids, key=lambda c: c["sample_count"]) \
                if self.centroids else None
 
@@ -670,7 +670,7 @@ class VoiceProfileCentroid:
 
     # ── internals ─────────────────────────────────────────────────────────
 
-    def _nearest(self, emb: np.ndarray) -> tuple[int, float]:
+    def _nearest(self, emb: np.ndarray):
         sims = [
             0.7 * float(np.clip(emb @ np.asarray(c["fused_embedding"]), -1.0, 1.0))
             + 0.3 / (1.0 + np.linalg.norm(emb - np.asarray(c["fused_embedding"])))
@@ -805,7 +805,7 @@ class AdaptiveThresholdManager:
             base += min((num_centroids - 2) * 0.015, 0.05)
         return float(np.clip(base, THRESHOLD_MIN, THRESHOLD_MAX))
 
-    def analyze(self, all_sims: list, best_id: int | None) -> None:
+    def analyze(self, all_sims: list, best_id) -> None:
         if not ENABLE_ADAPTIVE_THRESHOLDS or len(all_sims) < 2:
             return
         top2 = sorted([s[0] for s in all_sims], reverse=True)[:2]
@@ -871,24 +871,23 @@ threshold_manager = AdaptiveThresholdManager()
 class PLDA:
     """
     Full EM-trained PLDA with cached Cholesky inverses.
-    Scoring cost is O(D) after the one-time O(D³) cache at train time.
+    Scoring cost is O(D) after the one-time O(D^3) cache at train time.
     """
 
     def __init__(self, embedding_dim: int = PLDA_EMBEDDING_DIM,
                  latent_dim: int = PLDA_LATENT_DIM):
         self.embedding_dim           = embedding_dim
         self.latent_dim              = latent_dim
-        self.mean: np.ndarray | None = None
-        self.V:    np.ndarray | None = None
-        self.Sw:   np.ndarray | None = None
+        self.mean                    = None
+        self.V                       = None
+        self.Sw                      = None
         self.is_trained              = False
         self._n_speakers_trained     = 0
         self._llr_scale              = 1.0
-        # Cached per train — filled by _cache_inv()
-        self._Sw_inv:     np.ndarray | None = None
-        self._Sigmas_inv: np.ndarray | None = None
-        self._logdet_w:   float             = 0.0
-        self._logdet_s:   float             = 0.0
+        self._Sw_inv                 = None
+        self._Sigmas_inv             = None
+        self._logdet_w               = 0.0
+        self._logdet_s               = 0.0
 
     # ── training ─────────────────────────────────────────────────────────
 
@@ -900,7 +899,6 @@ class PLDA:
         D = all_e.shape[1]
         self.mean = all_e.mean(axis=0)
 
-        # Initial within-class scatter
         Sw = np.zeros((D, D), dtype=np.float64)
         nt, sp_means = 0, {}
         for sid, embs in speaker_embeddings.items():
@@ -911,7 +909,6 @@ class PLDA:
             nt += len(embs)
         Sw = Sw / max(nt, 1) + np.eye(D) * 1e-4
 
-        # Between-class scatter → initial V
         sp_mat   = np.asarray(list(sp_means.values()), dtype=np.float64) - self.mean
         Sb       = (sp_mat.T @ sp_mat) / max(len(sp_means), 1)
         ev, evec = np.linalg.eigh(Sb)
@@ -919,7 +916,6 @@ class PLDA:
         V        = evec[:, np.argsort(ev)[::-1][:k]].T.copy()
         Sw_inv   = np.linalg.inv(Sw)
 
-        # EM iterations
         for _ in range(n_iter):
             VSwi  = V @ Sw_inv
             Ainv  = np.linalg.inv(np.eye(k) + VSwi @ V.T)
@@ -960,7 +956,6 @@ class PLDA:
                  len(speaker_embeddings), k, n_iter, self._llr_scale)
 
     def _cache_inv(self) -> None:
-        """Pre-compute and cache matrix inverses (Cholesky for stability)."""
         if not self.is_trained or self.V is None or self.Sw is None:
             return
         D = self.embedding_dim
@@ -991,8 +986,6 @@ class PLDA:
             llrs.append(abs(self._raw(es[0], speaker_embeddings[d][0])))
         return max(float(np.median(llrs)), 1e-6)
 
-    # ── scoring ───────────────────────────────────────────────────────────
-
     def score(self, e1: np.ndarray, e2: np.ndarray) -> float:
         return self._raw(e1, e2) / self._llr_scale
 
@@ -1019,8 +1012,6 @@ class PLDA:
         qd = (x1 @ Si @ x1 + x2 @ Si @ x2) * 0.5
         qs = ((x1 - x2) @ Si @ (x1 - x2) + (x1 + x2) @ Ssi @ (x1 + x2)) * 0.25
         return float((ldw - lds) + (qd - qs))
-
-    # ── persistence ───────────────────────────────────────────────────────
 
     def save(self, path: str = PLDA_MODEL_PATH) -> None:
         with open(path, "wb") as fh:
@@ -1137,12 +1128,13 @@ if EncoderClassifier is not None:
         log.error("ResNet load failed: %s", _exc)
 
 if wavlm_model is None and ecapa_model is None and resnet_model is None:
-    raise RuntimeError(
+    log.error(
         "All three embedding models failed to load. "
         "Check your internet connection and pip install transformers speechbrain."
     )
 
 # ── PyAnnote diarization ──────────────────────────────────────────────────
+# FIX: allowlist TorchVersion for torch 2.5+ weights_only=True default
 diarization_pipeline = None
 if PyannotePipeline is not None:
     if not HF_TOKEN:
@@ -1150,8 +1142,17 @@ if PyannotePipeline is not None:
                     "Add it to .env to enable multi-speaker support.")
     else:
         try:
+            import torch.serialization
+            try:
+                from torch.torch_version import TorchVersion
+                torch.serialization.add_safe_globals([TorchVersion])
+                log.info("Registered TorchVersion as safe global for torch.load")
+            except Exception as _tv_exc:
+                log.warning("Could not register TorchVersion safe global: %s", _tv_exc)
+
             diarization_pipeline = PyannotePipeline.from_pretrained(
-    "pyannote/speaker-diarization-3.1", use_auth_token=HF_TOKEN)
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=HF_TOKEN)
             diarization_pipeline.to(torch.device("cpu"))
             torch.set_num_threads(multiprocessing.cpu_count())
             torch.set_grad_enabled(False)
@@ -1169,13 +1170,13 @@ if ENABLE_VAD:
         log.warning("webrtcvad not available — VAD disabled")
 
 # ── Backend managers ──────────────────────────────────────────────────────
-log.info("Initialising PLDA …")
+log.info("Initialising PLDA ...")
 plda_manager = PLDAManager()
 
-log.info("Initialising WCCN …")
+log.info("Initialising WCCN ...")
 wccn_manager = WCCNManager()
 
-log.info("Initialising ScoreNorm …")
+log.info("Initialising ScoreNorm ...")
 score_norm_manager = ScoreNormManager()
 
 log.info("=" * 60)
@@ -1244,11 +1245,7 @@ def _noise_filter(wav: np.ndarray) -> np.ndarray:
 
 
 def _audio_quality(wav: np.ndarray) -> float:
-    """
-    Estimate recording quality in [0, 1].
-    Uses a short leading silence window for SNR only when it looks like silence;
-    falls back to global energy variance otherwise (handles pre-trimmed audio).
-    """
+    """Estimate recording quality in [0, 1]."""
     if not ENABLE_QUALITY_SCORING or len(wav) < SAMPLE_RATE:
         return 1.0
     try:
@@ -1256,8 +1253,6 @@ def _audio_quality(wav: np.ndarray) -> float:
         noise_pwr  = float(np.mean(wav[:nn] ** 2)) + 1e-10
         speech_pwr = float(np.mean(wav[nn:] ** 2)) + 1e-10
 
-        # If leading window is louder than the rest, audio starts with speech
-        # — use global variance as quality proxy instead
         if noise_pwr > speech_pwr * 0.5:
             snr_score = float(np.clip(np.std(wav) / 0.10, 0.0, 1.0))
         else:
@@ -1291,17 +1286,12 @@ def _classify_gender(wav: np.ndarray) -> str:
 
 
 def _project_to_dim(emb: np.ndarray, target_dim: int = PLDA_EMBEDDING_DIM) -> np.ndarray:
-    """
-    Project any embedding to target_dim deterministically.
-      > target_dim : fold-average (energy-preserving)
-      < target_dim : zero-pad
-    """
+    """Project any embedding to target_dim deterministically."""
     e = np.asarray(emb, dtype=np.float64).ravel()
     d = target_dim
     if len(e) == d:
         return e
     if len(e) > d:
-        # Fold excess dimensions back
         while len(e) > d:
             half   = len(e) // 2
             rest   = len(e) - half
@@ -1316,7 +1306,7 @@ def _project_to_dim(emb: np.ndarray, target_dim: int = PLDA_EMBEDDING_DIM) -> np
     return e / n if n > 1e-8 else e
 
 
-def _encode_speechbrain(model, wav: np.ndarray) -> np.ndarray | None:
+def _encode_speechbrain(model, wav: np.ndarray):
     """Run a SpeechBrain EncoderClassifier on a 16 kHz waveform."""
     try:
         t = torch.FloatTensor(wav).unsqueeze(0)
@@ -1329,7 +1319,7 @@ def _encode_speechbrain(model, wav: np.ndarray) -> np.ndarray | None:
         return None
 
 
-def _encode_wavlm(wav: np.ndarray) -> np.ndarray | None:
+def _encode_wavlm(wav: np.ndarray):
     """Extract mean-pooled WavLM-Large speaker embedding (1024-dim)."""
     if wavlm_model is None or wavlm_extractor is None:
         return None
@@ -1348,7 +1338,7 @@ def _encode_wavlm(wav: np.ndarray) -> np.ndarray | None:
 
 
 # =============================================================================
-# HELPERS  (used by multiple higher-level functions)
+# HELPERS
 # =============================================================================
 
 def _get_fused(data) -> np.ndarray:
@@ -1363,10 +1353,7 @@ def _get_fused(data) -> np.ndarray:
 
 
 def _to_centroid(stored) -> VoiceProfileCentroid:
-    """
-    Always return a VoiceProfileCentroid regardless of stored format.
-    Legacy flat profiles are wrapped transparently.
-    """
+    """Always return a VoiceProfileCentroid regardless of stored format."""
     if isinstance(stored, dict) and "centroids" in stored:
         return VoiceProfileCentroid.from_dict(stored)
     obj = VoiceProfileCentroid(max_centroids=1)
@@ -1385,12 +1372,12 @@ def _sigmoid(x: float) -> float:
 # MAHALANOBIS DISTANCE CACHE
 # =============================================================================
 
-_mahal_inv_cov: np.ndarray | None = None
-_mahal_cache_n: int                = 0
-_mahal_lock                        = threading.Lock()
+_mahal_inv_cov = None
+_mahal_cache_n: int = 0
+_mahal_lock         = threading.Lock()
 
 
-def _get_inv_cov() -> np.ndarray | None:
+def _get_inv_cov():
     """Return regularised inverse covariance; rebuilt only when DB grows."""
     global _mahal_inv_cov, _mahal_cache_n
     if not ENABLE_MAHALANOBIS:
@@ -1433,35 +1420,17 @@ def _mahal_sim(a: np.ndarray, b: np.ndarray, ic: np.ndarray) -> float:
 # =============================================================================
 
 def extract_voice_embedding(audio_path: str,
-                             start_time: float | None = None,
-                             end_time:   float | None = None) -> dict | None:
+                             start_time=None,
+                             end_time=None):
     """
     Extract a fused 256-dim speaker embedding from an audio file or segment.
-
-    Parameters
-    ----------
-    audio_path  : path to any audio file supported by librosa
-    start_time  : segment start in seconds (optional)
-    end_time    : segment end   in seconds (optional)
-
-    Returns
-    -------
-    dict with keys:
-        fused_embedding  : np.ndarray (256,)   — primary key, input to PLDA/WCCN
-        ecapa_embedding  : np.ndarray | None   — raw ECAPA vector
-        resnet_embedding : np.ndarray | None   — raw ResNet vector
-        wavlm_embedding  : np.ndarray | None   — raw WavLM vector (1024-dim)
-        quality          : float  [0, 1]
-        gender           : str    'male' | 'female' | 'unknown'
-        duration         : float  seconds of speech used
-    None if audio is too short or all models fail.
+    Returns dict or None if audio is too short or all models fail.
     """
     try:
         wav, _ = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True,
                               dtype=np.float32)
         wav    = wav.astype(np.float64)
 
-        # Slice segment if requested
         if start_time is not None and end_time is not None:
             s = max(0, int(start_time * SAMPLE_RATE))
             e = min(len(wav), int(end_time * SAMPLE_RATE))
@@ -1472,7 +1441,6 @@ def extract_voice_embedding(audio_path: str,
         if len(wav) < int(MIN_SEGMENT_DURATION * SAMPLE_RATE):
             return None
 
-        # VAD → noise filter
         wav = _apply_vad(wav.astype(np.float32)).astype(np.float64)
         if len(wav) < int(MIN_SEGMENT_DURATION * SAMPLE_RATE):
             return None
@@ -1483,7 +1451,6 @@ def extract_voice_embedding(audio_path: str,
 
         wav_f32 = wav.astype(np.float32)
 
-        # ── Run all available models ──────────────────────────────────────
         wavlm_emb  = _encode_wavlm(wav_f32)
         ecapa_emb  = _encode_speechbrain(ecapa_model,  wav_f32) \
                      if ecapa_model  is not None else None
@@ -1494,11 +1461,10 @@ def extract_voice_embedding(audio_path: str,
             log.warning("All models returned None for %s", audio_path)
             return None
 
-        # ── Weighted fusion → 256-dim ─────────────────────────────────────
         w_wlm = WAVLM_WEIGHT  if wavlm_emb  is not None else 0.0
         w_eca = ECAPA_WEIGHT  if ecapa_emb  is not None else 0.0
         w_rsn = RESNET_WEIGHT if resnet_emb is not None else 0.0
-        total = w_wlm + w_eca + w_rsn          # renormalise if any model missing
+        total = w_wlm + w_eca + w_rsn
 
         fused = np.zeros(PLDA_EMBEDDING_DIM, dtype=np.float64)
         if wavlm_emb  is not None:
@@ -1527,14 +1493,11 @@ def extract_voice_embedding(audio_path: str,
 
 
 # =============================================================================
-# VERIFICATION  (internal helper)
+# VERIFICATION
 # =============================================================================
 
-def verify_speaker_match(embedding_data: dict, profile_id: int) -> tuple[bool, float]:
-    """
-    Secondary verification gate called only for candidates above threshold.
-    Applies three independent checks: similarity score, cosine gate, PLDA gate.
-    """
+def verify_speaker_match(embedding_data: dict, profile_id: int):
+    """Secondary verification gate — three independent checks."""
     try:
         with _db_lock:
             conn = _get_conn()
@@ -1586,21 +1549,8 @@ def verify_speaker_match(embedding_data: dict, profile_id: int) -> tuple[bool, f
 # CORE FUNCTION 2 — find_matching_speaker()
 # =============================================================================
 
-def find_matching_speaker(embedding_data: dict) -> dict | None:
-    """
-    Identify the best matching speaker profile.
-
-    Scoring pipeline per candidate:
-        1. Multi-centroid cosine + PLDA + S-Norm score   (85%)
-        2. Mahalanobis distance score                     (15%)
-        → Ensemble score compared against adaptive threshold
-        → Candidates above threshold go through verify_speaker_match()
-
-    Returns
-    -------
-    dict: {id, name, confidence, similarity, verified, num_centroids}
-    None if no profile passes the threshold.
-    """
+def find_matching_speaker(embedding_data: dict):
+    """Identify the best matching speaker profile."""
     try:
         with _db_lock:
             conn     = _get_conn()
@@ -1620,20 +1570,19 @@ def find_matching_speaker(embedding_data: dict) -> dict | None:
     if wccn_manager.is_ready:
         fused_t = wccn_manager.transform(fused_t)
 
-    all_sims:           list = []
-    best_match:  dict | None = None
-    best_sim:          float = 0.0
+    all_sims  = []
+    best_match = None
+    best_sim   = 0.0
 
     for pid, name, blob, total_rec in profiles:
         try:
-            stored   = pickle.loads(blob)
+            stored = pickle.loads(blob)
         except Exception:
             continue
 
         cobj     = _to_centroid(stored)
         num_cent = len(cobj.centroids)
 
-        # Leg 1: cosine + PLDA
         cosine_score = cobj.best_score(
             embedding_data,
             plda_mgr=plda_manager,
@@ -1642,7 +1591,6 @@ def find_matching_speaker(embedding_data: dict) -> dict | None:
             speaker_id=pid,
         )
 
-        # Leg 2: Mahalanobis
         mahal_score = 0.0
         if inv_cov is not None:
             prim = cobj.primary()
@@ -1652,7 +1600,6 @@ def find_matching_speaker(embedding_data: dict) -> dict | None:
                     cf = wccn_manager.transform(cf)
                 mahal_score = _mahal_sim(fused_t, cf, inv_cov)
 
-        # Ensemble
         if inv_cov is not None:
             denom    = ENSEMBLE_COSINE_WEIGHT + ENSEMBLE_MAHAL_WEIGHT
             ensemble = (ENSEMBLE_COSINE_WEIGHT * cosine_score
@@ -1685,23 +1632,7 @@ def find_matching_speaker(embedding_data: dict) -> dict | None:
 # =============================================================================
 
 def daily_model_update(force: bool = False) -> dict:
-    """
-    Retrain PLDA, WCCN, and ScoreNorm from all current DB data.
-
-    Parameters
-    ----------
-    force : if True, skip minimum-speaker checks and retrain regardless.
-
-    Returns
-    -------
-    dict:
-        plda_retrained       : bool
-        wccn_retrained       : bool
-        score_norm_retrained : bool
-        num_speakers         : int
-        duration_seconds     : float
-        timestamp            : str  (ISO-8601)
-    """
+    """Retrain PLDA, WCCN, and ScoreNorm from all current DB data."""
     t0  = time.time()
     ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log.info("=" * 60)
@@ -1722,10 +1653,9 @@ def daily_model_update(force: bool = False) -> dict:
     result["num_speakers"] = n
     log.info("Speakers in DB: %d", n)
 
-    # ── PLDA ──────────────────────────────────────────────────────────────
     if n >= PLDA_MIN_SPEAKERS or force:
         try:
-            log.info("Retraining PLDA …")
+            log.info("Retraining PLDA ...")
             plda_manager.plda.train(embs)
             plda_manager.plda.save()
             plda_manager.plda._cache_inv()
@@ -1737,16 +1667,14 @@ def daily_model_update(force: bool = False) -> dict:
     else:
         log.info("PLDA skipped (need >=%d, have %d)", PLDA_MIN_SPEAKERS, n)
 
-    # ── WCCN ──────────────────────────────────────────────────────────────
     qualified = {sid: ev for sid, ev in embs.items()
                  if len(ev) >= WCCN_MIN_SAMPLES_PER_SPEAKER}
     if len(qualified) >= WCCN_MIN_SPEAKERS or force:
         try:
-            log.info("Retraining WCCN …")
+            log.info("Retraining WCCN ...")
             wccn_manager.wccn.train(embs)
             wccn_manager.wccn.save()
             wccn_manager._since = 0
-            # Invalidate Mahalanobis cache — covariance space has changed
             global _mahal_cache_n
             _mahal_cache_n = 0
             result["wccn_retrained"] = True
@@ -1756,10 +1684,9 @@ def daily_model_update(force: bool = False) -> dict:
     else:
         log.info("WCCN skipped (need >=%d qualified speakers)", WCCN_MIN_SPEAKERS)
 
-    # ── Score Normalisation ───────────────────────────────────────────────
     if n >= SCORE_NORM_MIN_SPEAKERS or force:
         try:
-            log.info("Retraining ScoreNorm …")
+            log.info("Retraining ScoreNorm ...")
             score_norm_manager.normalizer.train(embs)
             score_norm_manager.normalizer.save()
             score_norm_manager._since = 0
@@ -1807,7 +1734,7 @@ if ENABLE_DAILY_RETRAINING and HAS_APSCHEDULER:
 # DATABASE OPERATIONS
 # =============================================================================
 
-def create_voice_profile(name: str, embedding_data: dict) -> int | None:
+def create_voice_profile(name: str, embedding_data: dict):
     """Create a new speaker profile. Returns the new profile id."""
     try:
         now = datetime.now().isoformat()
@@ -1934,7 +1861,7 @@ def delete_speaker(profile_id: int) -> bool:
         return False
 
 
-def list_speakers() -> list[dict]:
+def list_speakers() -> list:
     """Return all speaker profiles as a list of dicts."""
     try:
         with _db_lock:
@@ -1973,11 +1900,8 @@ def _merge_segments(segments: list, gap_s: float = 0.15) -> list:
     return merged
 
 
-def _process_speaker_segments(args: tuple) -> dict | None:
-    """
-    Worker function — extract and average embeddings for one diarized speaker.
-    Runs in a thread pool; must not access shared mutable state directly.
-    """
+def _process_speaker_segments(args: tuple):
+    """Worker — extract and average embeddings for one diarized speaker."""
     label, info, audio_path = args
     total_dur = float(info["total_duration"])
 
@@ -1999,7 +1923,6 @@ def _process_speaker_segments(args: tuple) -> dict | None:
     if not embs:
         return None
 
-    # Outlier rejection on fused embeddings
     if len(embs) > 3:
         fvecs = np.array([e["fused_embedding"] for e in embs], dtype=np.float64)
         med   = np.median(fvecs, axis=0)
@@ -2013,13 +1936,11 @@ def _process_speaker_segments(args: tuple) -> dict | None:
     wn   = np.asarray(weights, dtype=np.float64)
     wn   = wn / wn.sum()
 
-    # Average fused embedding
     avgf = np.average(
         np.array([e["fused_embedding"] for e in embs], dtype=np.float64),
         axis=0, weights=wn)
     avgf /= (np.linalg.norm(avgf) + 1e-8)
 
-    # Average ECAPA embedding (used for per-centroid ECAPA branch in scoring)
     avg_ecapa = None
     ecapa_pairs = [(e["ecapa_embedding"], w)
                    for e, w in zip(embs, wn)
@@ -2054,29 +1975,15 @@ def _process_speaker_segments(args: tuple) -> dict | None:
 # =============================================================================
 
 def _safe_tmpfile(audio_path: str) -> str:
-    """
-    Create a unique temp WAV path in the system temp directory.
-    Avoids the race condition of reusing the same name for parallel files.
-    """
+    """Create a unique temp WAV path."""
     suffix = Path(audio_path).stem[:20]
     fd, path = tempfile.mkstemp(prefix=f"vocald_{suffix}_", suffix=".wav")
     os.close(fd)
     return path
 
 
-def perform_smart_diarization(audio_path: str) -> dict | None:
-    """
-    Run PyAnnote diarization with automatic two-strategy fallback.
-
-    Strategy 1 — unconstrained detection.
-    Strategy 2 — min_speakers=2 if strategy 1 yields only 1 speaker
-                 in audio >15 s, or fewer than 3 speakers in audio >3 min.
-
-    Returns
-    -------
-    dict: {label: {segments: [...], total_duration: float}}
-    None if diarization unavailable or all speakers too short.
-    """
+def perform_smart_diarization(audio_path: str):
+    """Run PyAnnote diarization with automatic two-strategy fallback."""
     if diarization_pipeline is None:
         return None
 
@@ -2107,7 +2014,7 @@ def perform_smart_diarization(audio_path: str) -> dict | None:
             or (duration > 180 and len(spk) < 3)
         )
         if needs_retry:
-            log.info("Strategy 2: forcing min_speakers=2 …")
+            log.info("Strategy 2: forcing min_speakers=2 ...")
             with torch.no_grad():
                 out = diarization_pipeline(tmp, min_speakers=2, max_speakers=20)
             spk = {}
@@ -2148,34 +2055,18 @@ def perform_smart_diarization(audio_path: str) -> dict | None:
 # MAIN PIPELINE — process_audio_file()
 # =============================================================================
 
-def process_audio_file(audio_path: str, filename: str) -> list[dict]:
-    """
-    Full pipeline: diarize → embed → identify/enroll each speaker.
-
-    Parameters
-    ----------
-    audio_path : path to audio file
-    filename   : display name used in log messages and default speaker names
-
-    Returns
-    -------
-    list of dicts, one per speaker found:
-        speaker_index    : int
-        name             : str
-        confidence       : float  (0–100)
-        voice_profile_id : int | None
-    """
+def process_audio_file(audio_path: str, filename: str) -> list:
+    """Full pipeline: diarize -> embed -> identify/enroll each speaker."""
     log.info("=" * 60)
     log.info("PROCESSING: %s", filename)
     log.info("=" * 60)
     t0       = time.time()
-    speakers: list[dict] = []
+    speakers: list = []
     stem     = Path(filename).stem
 
     try:
         spk_data = perform_smart_diarization(audio_path)
 
-        # ── Single-speaker mode ───────────────────────────────────────────
         if not spk_data:
             log.info("Single-speaker mode (no diarization output)")
             emb = extract_voice_embedding(audio_path)
@@ -2214,7 +2105,6 @@ def process_audio_file(audio_path: str, filename: str) -> list[dict]:
                     "voice_profile_id": pid,
                 })
 
-        # ── Multi-speaker mode ────────────────────────────────────────────
         else:
             log.info("Multi-speaker: %d speaker(s) detected", len(spk_data))
 
@@ -2304,5 +2194,3 @@ if __name__ == "__main__":
     log.info("  match    = find_matching_speaker(emb)")
     log.info("  speakers = process_audio_file('meeting.wav', 'meeting.wav')")
     log.info("  print(list_speakers())")
-
-    
