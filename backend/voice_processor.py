@@ -18,6 +18,7 @@ from sklearn.cluster import DBSCAN
 import librosa
 import soundfile as sf
 import webrtcvad
+import tempfile
 
 try:
     from speechbrain.inference.speaker import EncoderClassifier
@@ -140,7 +141,7 @@ class ScoreNormalizer:
         
         self._num_speakers_at_train = 0
     
-    def train(self, speaker_embeddings: dict[int, list[np.ndarray]]) -> None:
+    def train(self, speaker_embeddings: dict) -> None:
         """Train score normalization from speaker embeddings."""
         if len(speaker_embeddings) < SCORE_NORM_MIN_SPEAKERS:
             print(f"   ℹ️  ScoreNorm: need ≥ {SCORE_NORM_MIN_SPEAKERS} speakers. "
@@ -240,7 +241,6 @@ class ScoreNormalizer:
     def _zt_norm(self, raw_score: float, test_emb: np.ndarray, 
                  enroll_emb: np.ndarray, speaker_id: int) -> float:
         """ZT-Norm: Z-norm + T-norm normalization."""
-        # Z-norm
         z_scores = []
         if test_emb is not None and len(self.cohort_embeddings) > 0:
             for cohort_emb in self.cohort_embeddings[:ZT_NORM_SIZE]:
@@ -253,7 +253,6 @@ class ScoreNormalizer:
         else:
             z_normalized = raw_score
         
-        # T-norm
         t_normalized = z_normalized
         if enroll_emb is not None and len(self.cohort_embeddings) > 0:
             t_scores = []
@@ -265,7 +264,6 @@ class ScoreNormalizer:
                 t_std = np.std(t_scores) + 1e-6
                 t_normalized = (z_normalized - (t_mean - z_mean) / t_std)
         
-        # Convert to probability
         normalized = 1.0 / (1.0 + np.exp(-t_normalized))
         return float(np.clip(normalized, 0.0, 1.0))
     
@@ -278,7 +276,6 @@ class ScoreNormalizer:
         for cohort_emb in self.cohort_embeddings:
             cohort_scores.append(self._raw_similarity(test_emb, cohort_emb))
         
-        # Use top-N highest impostor scores
         cohort_scores_sorted = sorted(cohort_scores, reverse=True)
         top_scores = cohort_scores_sorted[:SNORM_TOP_N]
         
@@ -411,12 +408,12 @@ class WCCN:
     
     def __init__(self, embedding_dim: int = PLDA_EMBEDDING_DIM):
         self.embedding_dim = embedding_dim
-        self.W: np.ndarray | None = None
-        self.mean: np.ndarray | None = None
+        self.W = None
+        self.mean = None
         self.is_trained = False
         self._num_speakers_at_train = 0
     
-    def train(self, speaker_embeddings: dict[int, list[np.ndarray]]) -> None:
+    def train(self, speaker_embeddings: dict) -> None:
         valid_speakers = {
             sid: embs for sid, embs in speaker_embeddings.items()
             if len(embs) >= WCCN_MIN_SAMPLES_PER_SPEAKER
@@ -546,9 +543,9 @@ class WCCNManager:
         return self.wccn.transform(embedding)
 
 
-def _collect_all_embeddings_from_db() -> dict[int, list[np.ndarray]]:
+def _collect_all_embeddings_from_db() -> dict:
     """Collect ALL embeddings from all centroids for training."""
-    result: dict[int, list[np.ndarray]] = {}
+    result = {}
     try:
         conn = sqlite3.connect(DB_PATH, timeout=10.0)
         cursor = conn.cursor()
@@ -742,7 +739,6 @@ class VoiceProfileCentroid:
         
         res_emb = self._extract_resemblyzer(embedding_data)
         
-        # Apply WCCN transformation
         if wccn_manager and wccn_manager.is_ready:
             res_emb = wccn_manager.transform(res_emb)
         
@@ -754,7 +750,6 @@ class VoiceProfileCentroid:
         for centroid in self.centroids:
             cent_res = centroid['resemblyzer_embedding']
             
-            # Apply WCCN to stored centroid
             if wccn_manager and wccn_manager.is_ready:
                 cent_res = wccn_manager.transform(cent_res)
             
@@ -779,7 +774,6 @@ class VoiceProfileCentroid:
             else:
                 final_score = base_score
             
-            # Apply score normalization
             if score_norm_manager and score_norm_manager.is_ready:
                 final_score = score_norm_manager.normalize(
                     final_score, 
@@ -908,8 +902,7 @@ class AdaptiveThresholdManager:
         
         return float(np.clip(base, THRESHOLD_MIN, THRESHOLD_MAX))
     
-    def analyze_and_adjust(self, all_similarities: list[tuple[float, int, str]], 
-                          best_match_id: int | None) -> None:
+    def analyze_and_adjust(self, all_similarities, best_match_id) -> None:
         if not ENABLE_ADAPTIVE_THRESHOLDS or len(all_similarities) < 2:
             return
         
@@ -1004,13 +997,13 @@ class PLDA:
                  latent_dim: int = PLDA_LATENT_DIM):
         self.embedding_dim = embedding_dim
         self.latent_dim = latent_dim
-        self.mean: np.ndarray | None = None
-        self.V: np.ndarray | None = None
-        self.Sigma_w: np.ndarray | None = None
+        self.mean = None
+        self.V = None
+        self.Sigma_w = None
         self.is_trained = False
         self._num_speakers_at_train = 0
     
-    def train(self, speaker_embeddings: dict[int, list[np.ndarray]], n_iter: int = 10) -> None:
+    def train(self, speaker_embeddings: dict, n_iter: int = 10) -> None:
         all_embs = []
         for embs in speaker_embeddings.values():
             all_embs.extend(embs)
@@ -1100,8 +1093,7 @@ class PLDA:
         print(f"   ✅ PLDA trained  |  speakers={len(speaker_embeddings)}  "
               f"|  latent_dim={k}  |  iters={n_iter}  |  llr_scale={self._llr_scale:.2f}")
     
-    def _calibrate_scale(self, speaker_embeddings: dict[int, list[np.ndarray]], 
-                         n_samples: int = 30) -> float:
+    def _calibrate_scale(self, speaker_embeddings: dict, n_samples: int = 30) -> float:
         sids = list(speaker_embeddings.keys())
         if len(sids) < 2:
             return 1.0
@@ -1291,8 +1283,16 @@ try:
     if not hf_token:
         print("⚠️ No HUGGINGFACE_TOKEN in .env")
     else:
+        # FIX 1: Register TorchVersion for torch 2.5+ compatibility
+        import torch.serialization
+        try:
+            from torch.torch_version import TorchVersion
+            torch.serialization.add_safe_globals([TorchVersion])
+        except Exception:
+            pass
+        # FIX 2: use_auth_token= instead of token= (correct kwarg for installed version)
         diarization_pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1", token=hf_token
+            "pyannote/speaker-diarization-3.1", use_auth_token=hf_token
         )
         diarization_pipeline.to(torch.device("cpu"))
         num_cores = multiprocessing.cpu_count()
@@ -1486,32 +1486,33 @@ def extract_voice_embedding(audio_path, start_time=None, end_time=None):
 def perform_smart_diarization(audio_path):
     if diarization_pipeline is None:
         return None
+    # FIX 3: use tempfile.mkstemp instead of string replacement to avoid race conditions
+    tmp = None
     try:
         print("🔍 Analyzing audio for speakers…")
         y, sr = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
         duration = len(y) / sr
         print(f"📊 Audio duration: {duration:.1f}s ({duration/60:.1f} min)")
-        
-        temp_wav = audio_path.replace(os.path.splitext(audio_path)[1], '_temp.wav')
-        sf.write(temp_wav, y, SAMPLE_RATE, subtype='PCM_16')
-        
+
+        fd, tmp = tempfile.mkstemp(prefix='vocald_diar_', suffix='.wav')
+        os.close(fd)
+        sf.write(tmp, y, SAMPLE_RATE, subtype='PCM_16')
+
         with torch.no_grad():
             print("   Strategy 1: Unconstrained detection…")
-            diarization_output = diarization_pipeline(temp_wav)
-        
-        if os.path.exists(temp_wav):
-            os.remove(temp_wav)
-        
+            diarization_output = diarization_pipeline(tmp)
+
+        # FIX 4: PyAnnote 3.1 returns Annotation directly, not .speaker_diarization
         speakers_data = {}
-        for segment, _, label in diarization_output.speaker_diarization.itertracks(yield_label=True):
+        for segment, _, label in diarization_output.itertracks(yield_label=True):
             speakers_data.setdefault(label, []).append({
                 'start': segment.start,
                 'end': segment.end,
                 'duration': segment.end - segment.start,
             })
-        
+
         print(f"   ✅ Found {len(speakers_data)} speaker(s)")
-        
+
         needs_retry = (
             (len(speakers_data) == 1 and duration > 15) or
             (duration > 180 and len(speakers_data) < 3) or
@@ -1520,23 +1521,20 @@ def perform_smart_diarization(audio_path):
         if needs_retry:
             min_spk = 2
             print(f"   Strategy 2: Retrying with min_speakers={min_spk}…")
-            sf.write(temp_wav, y, SAMPLE_RATE, subtype='PCM_16')
             with torch.no_grad():
                 diarization_output = diarization_pipeline(
-                    temp_wav, min_speakers=min_spk, max_speakers=20
+                    tmp, min_speakers=min_spk, max_speakers=20
                 )
-            if os.path.exists(temp_wav):
-                os.remove(temp_wav)
-            
+
             speakers_data = {}
-            for segment, _, label in diarization_output.speaker_diarization.itertracks(yield_label=True):
+            for segment, _, label in diarization_output.itertracks(yield_label=True):
                 speakers_data.setdefault(label, []).append({
                     'start': segment.start,
                     'end': segment.end,
                     'duration': segment.end - segment.start,
                 })
             print(f"   ✅ Retry found {len(speakers_data)} speaker(s)")
-        
+
         filtered = {}
         for label, segs in speakers_data.items():
             total = sum(s['duration'] for s in segs)
@@ -1544,17 +1542,20 @@ def perform_smart_diarization(audio_path):
                 filtered[label] = {'segments': segs, 'total_duration': total}
             else:
                 print(f"   ⚠️ Filtered: {label} ({total:.2f}s < {MIN_SPEAKING_TIME}s)")
-        
+
         print(f"✅ Final: {len(filtered)} speaker(s) detected")
         return filtered or None
-    
+
     except Exception as e:
         print(f"❌ Diarization error: {e}")
         import traceback; traceback.print_exc()
-        temp_wav = audio_path.replace(os.path.splitext(audio_path)[1], '_temp.wav')
-        if os.path.exists(temp_wav):
-            os.remove(temp_wav)
         return None
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 # =========================================================================
@@ -1623,7 +1624,6 @@ def calculate_similarity_legacy(emb1_data, emb2_data) -> float:
     r1 = _extract_resemblyzer(emb1_data)
     r2 = _extract_resemblyzer(emb2_data)
     
-    # Apply WCCN if available
     if wccn_manager.is_ready:
         r1 = wccn_manager.transform(r1)
         r2 = wccn_manager.transform(r2)
@@ -1652,7 +1652,6 @@ def calculate_similarity_legacy(emb1_data, emb2_data) -> float:
     else:
         final_score = base_score
     
-    # Apply score normalization
     if score_norm_manager.is_ready:
         final_score = score_norm_manager.normalize(final_score, test_emb=r1)
     
@@ -1672,7 +1671,7 @@ def _extract_resemblyzer(data):
     return np.array(data, dtype=np.float64)
 
 
-def verify_speaker_match(embedding_data, profile_id) -> tuple[bool, float]:
+def verify_speaker_match(embedding_data, profile_id):
     """Verify speaker match with all enhancements."""
     try:
         conn = sqlite3.connect(DB_PATH, timeout=10.0)
@@ -1708,7 +1707,6 @@ def verify_speaker_match(embedding_data, profile_id) -> tuple[bool, float]:
         primary_centroid = centroid_obj.get_primary_centroid() if isinstance(stored, dict) and 'centroids' in stored else stored
         r_old = _extract_resemblyzer(primary_centroid)
         
-        # Apply WCCN
         if wccn_manager.is_ready:
             r_new = wccn_manager.transform(r_new)
             r_old = wccn_manager.transform(r_old)
